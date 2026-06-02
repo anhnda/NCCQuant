@@ -4,12 +4,20 @@ Quantization driver.
 Loads a HuggingFace causal LM, builds a non-uniform codebook quantizer by name
 (nf3 / nf4 / nvfp4 / codebook3 / codebook4), and quantizes every nn.Linear layer.
 Optionally applies NCC first-moment correction, for which it collects the
-per-layer activation mean mu = E[x] over a calibration set via forward hooks.
+per-layer activation mean mu = E[x] (and variance sigma_ii = Var[x]) over a
+calibration set via forward hooks.
 
 Design mirrors the uploaded AWQ XL script: bfloat16 load, device_map="auto",
 batched calibration hooks, aggressive cleanup. The base group-wise uniform
 quantizer is replaced by the per-channel non-uniform codebook quantizer; the
 salience grid-search is replaced by NCC's first-moment correction.
+
+Global ASYM flag (quantizers.base_quantizer.ASYM) selects symmetric (absmax) vs
+asymmetric (affine min/max) per-block mapping; exposed here via --asym/--no-asym.
+
+NCC selection rule is chosen with --ncc-score:
+    lite : eta = |mu_i| / g                       (covariance-free)
+    cov  : eta = |mu_i| / ((sigma_ii + eps) * g)  (diagonal bias-variance)
 
 Key option: --skip-lmhead (default TRUE). When set, the lm_head Linear is left in
 full precision (it is large and quantizing it hurts perplexity most).
@@ -30,9 +38,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-# near the top imports
+
 import quantizers.base_quantizer as base_q
 from quantizers import get_quantizer, apply_ncc
+
 
 # --------------------------------------------------------------------------- #
 # Calibration data
@@ -53,8 +62,9 @@ class ActMeanCollector:
     For a Linear with weight [out, in], the input x has last-dim = in, which is
     exactly the dimension NCC's mu lives on. We accumulate sum and count to form
     mu = E[x] in a streaming, memory-light way (no stored activations).
-    Optionally also accumulates E[x^2] to give NCC a variance estimate for the
-    James-Stein stabiliser.
+    Optionally also accumulates E[x^2] to give NCC a per-input-channel variance
+    estimate: sigma_ii = E[x^2] - E[x]^2 (used by score='cov' and, divided by the
+    token count m, by the James-Stein stabiliser).
     """
 
     def __init__(self, want_var: bool = True):
@@ -122,6 +132,11 @@ def quantize_model(
     n_calib: int = 128,
     max_length: int = 512,
     row_chunk: int = 1024,
+    ncc_score: str = "lite",
+    cov_eps: float = 1e-6,
+    gap_floor: float = 1e-8,
+    gap_floor_rel: float = 0.0,
+    use_james_stein: bool = False,
 ):
     # Gather target Linear layers.
     linears = [(n, m) for n, m in model.named_modules() if isinstance(m, nn.Linear)]
@@ -130,12 +145,16 @@ def quantize_model(
     print(f"Quantizing {len(linears)} Linear layers "
           f"({'skipping' if skip_lmhead else 'including'} lm_head)")
 
-    # Collect activation means only if NCC is on.
+    # Collect activation means (and variances) only if NCC is on.
     means: Dict[str, torch.Tensor] = {}
     varis: Dict[str, torch.Tensor] = {}
+    collector_counts: Dict[str, int] = {}
     if use_ncc:
-        print("Collecting activation means for NCC ...")
-        collector = ActMeanCollector(want_var=True)
+        # cov rule and James-Stein both need second moments.
+        want_var = (ncc_score == "cov") or use_james_stein
+        print(f"Collecting activation means for NCC "
+              f"(want_var={want_var}, score={ncc_score}) ...")
+        collector = ActMeanCollector(want_var=want_var)
         collector.register(linears)
         for i, text in enumerate(calib_texts[:n_calib]):
             inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length)
@@ -152,6 +171,7 @@ def quantize_model(
                 v = collector.var(n)
                 if v is not None:
                     varis[n] = v
+                collector_counts[n] = collector.count[n]   # token count m, for JS
         del collector
         gc.collect()
 
@@ -166,13 +186,26 @@ def quantize_model(
 
         if use_ncc and n in means:
             mu = means[n].to(W.device)
-            mu_var = varis.get(n)
-            if mu_var is not None:
-                mu_var = mu_var.to(W.device)
+            # Raw per-input-channel activation variance == sigma_ii (for cov rule).
+            sigma_ii = varis.get(n)
+            if sigma_ii is not None:
+                sigma_ii = sigma_ii.to(W.device)
+            # James-Stein needs variance OF THE MEAN = sigma_ii / m, not raw sigma_ii
+            # (else the shrink factor is inflated by ~m and collapses mu).
+            mu_var = None
+            if use_james_stein and sigma_ii is not None:
+                m = max(1, collector_counts.get(n, 1))
+                mu_var = sigma_ii / m
             W_out, stats = apply_ncc(
                 W_fp=W, qres=res, mu=mu,
-                budget_p=budget_p, use_james_stein=False, mu_var=mu_var,
+                budget_p=budget_p,
+                use_james_stein=use_james_stein, mu_var=mu_var,
                 row_chunk=row_chunk,
+                score=ncc_score,
+                sigma_ii=sigma_ii,
+                cov_eps=cov_eps,
+                gap_floor=gap_floor,
+                gap_floor_rel=gap_floor_rel,
             )
             total_flips += stats.flips
             bias_before_sum += stats.bias_before
@@ -184,6 +217,7 @@ def quantize_model(
 
     print("Quantization complete.")
     if use_ncc:
+        print(f"  NCC selection rule: {ncc_score}")
         print(f"  NCC total flips: {total_flips}")
         print(f"  Calibration first-moment error: "
               f"{bias_before_sum:.6e} -> {bias_after_sum:.6e}")
@@ -209,6 +243,32 @@ def main():
     p.add_argument("--calib-dataset", type=str, default="wikitext2-simple",
                    choices=["wikitext2-simple"])
     p.add_argument("--seed", type=int, default=42)
+
+    # Symmetric vs asymmetric per-block mapping (global ASYM flag).
+    p.add_argument("--asym", dest="asym", action="store_true", default=True,
+                   help="Asymmetric (affine min/max) quantization (default: True)")
+    p.add_argument("--no-asym", dest="asym", action="store_false",
+                   help="Symmetric (absmax) quantization")
+
+    # NCC selection rule and its knobs.
+    p.add_argument("--ncc-score", type=str, default="lite",
+                   choices=["lite", "cov"],
+                   help="NCC selection rule: 'lite' (|mu|/g, covariance-free) or "
+                        "'cov' (|mu|/((sigma_ii+eps)*g), diagonal bias-variance).")
+    p.add_argument("--cov-eps", type=float, default=1e-6,
+                   help="Stabiliser added to sigma_ii in the 'cov' rule denominator "
+                        "(ignored for 'lite').")
+    p.add_argument("--gap-floor", type=float, default=1e-8,
+                   help="Absolute lower bound on a feasible complementary gap "
+                        "(Assumption 2, strict g>0; degenerate-codeword cleanup).")
+    p.add_argument("--gap-floor-rel", type=float, default=0.0,
+                   help="OPTIONAL relative gap floor as a fraction of the per-row "
+                        "median gap (ablation only; contradicts the theory if >0).")
+    p.add_argument("--use-james-stein", dest="use_james_stein",
+                   action="store_true", default=False,
+                   help="Apply James-Stein shrinkage to mu (ablation row; off by "
+                        "default). Uses variance-of-the-mean = sigma_ii / m.")
+
     # quantizer-specific knobs (block = standard non-uniform scaling granularity)
     p.add_argument("--nf-block-size", type=int, default=64, help="NF3/NF4 block size (bnb default 64)")
     p.add_argument("--nvfp4-block-size", type=int, default=16, help="NVFP4 micro-block size")
@@ -216,15 +276,7 @@ def main():
     p.add_argument("--kmeans-iters", type=int, default=20, help="learned-codebook k-means iters")
     p.add_argument("--row-chunk", type=int, default=1024,
                    help="output rows processed at once (memory bound; no effect on result)")
-    # in main(), add to the argparser:
-    p.add_argument("--asym", dest="asym", action="store_true", default=True,
-                   help="Asymmetric (affine min/max) quantization (default: True)")
-    p.add_argument("--no-asym", dest="asym", action="store_false",
-                   help="Symmetric (absmax) quantization")
     args = p.parse_args()
-    # in main(), right after args = p.parse_args() and seeding, BEFORE get_quantizer:
-    base_q.ASYM = args.asym
-    print(f"ASYM mode: {base_q.ASYM}")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -232,10 +284,16 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
+    # Set the global asymmetric flag before any quantizer is built; quantize()
+    # reads quantizers.base_quantizer.ASYM at call time.
+    base_q.ASYM = args.asym
+    print(f"ASYM mode: {base_q.ASYM}")
+
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device} | Quantizer: {args.quantizer} | skip_lmhead={args.skip_lmhead}")
+    print(f"Device: {device} | Quantizer: {args.quantizer} | "
+          f"skip_lmhead={args.skip_lmhead} | ncc_score={args.ncc_score}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -264,6 +322,11 @@ def main():
         use_ncc=args.use_ncc, budget_p=args.budget_p,
         skip_lmhead=args.skip_lmhead, n_calib=args.n_calib,
         max_length=args.max_length, row_chunk=args.row_chunk,
+        ncc_score=args.ncc_score,
+        cov_eps=args.cov_eps,
+        gap_floor=args.gap_floor,
+        gap_floor_rel=args.gap_floor_rel,
+        use_james_stein=args.use_james_stein,
     )
 
     os.makedirs(args.output_dir, exist_ok=True)

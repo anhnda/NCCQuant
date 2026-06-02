@@ -29,3 +29,7 @@ C4              9.3916          9.4012
 
 python quantize.py --model-path /home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b --quantizer nf4 --output-dir ./quantized_models/llama3.1_nf4_ncc
 python compare_slicing.py --heuristic-path ./quantized_models/llama3.1_nf4_ncc/
+
+
+python quantize.py --model-path /home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b --quantizer nf4 --no-ncc --output-dir ./quantized_models/llama3.1_nf4
+python compare_slicing.py --heuristic-path ./quantized_models/llama3.1_nf4/
