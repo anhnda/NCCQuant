@@ -1,17 +1,21 @@
 """
-Non-uniform codebook quantizers + NCC correction.
+Non-uniform codebook quantizers (block-wise standard) + NCC correction.
 
 Public API
 ----------
     get_quantizer(name, **kwargs) -> BaseQuantizer
-    QUANTIZER_REGISTRY                  # name -> factory
+    apply_ncc(W_fp, qres, mu, ...) -> (W_corrected, NCCStats)
 
-Supported names: nf3, nf4, nvfp4, codebook3, codebook4.
+Names: nf3, nf4, nvfp4, codebook3, codebook4.
 
-Each quantizer exposes a single contract:
-    res = quantizer.quantize(W)         # QuantResult(W_dequant, indices, codebook, scale)
-and NCC consumes that result:
-    W_corr, stats = apply_ncc(W_fp, res, mu, budget_p=...)
+Standard granularity (block = contiguous run along input sharing one scale):
+    NF3/NF4   block_size 64   (bitsandbytes default)
+    NVFP4     block_size 16   (NVIDIA), FP8 E4M3 block scale
+    codebook  block_size 64   (per-block learned levels)
+
+Contract:
+    res = quantizer.quantize(W, row_chunk=1024)   # block-wise, OOM-safe
+    W_corr, stats = apply_ncc(W_fp, res, mu, budget_p=..., row_chunk=1024)
 """
 
 from __future__ import annotations
@@ -24,26 +28,26 @@ from .ncc import apply_ncc, NCCStats, james_stein_mean
 
 
 def _nf3(**kw):
-    return NormalFloatQuantizer(bits=3)
+    return NormalFloatQuantizer(bits=3, block_size=kw.get("nf_block_size", 64))
 
 
 def _nf4(**kw):
-    return NormalFloatQuantizer(bits=4)
+    return NormalFloatQuantizer(bits=4, block_size=kw.get("nf_block_size", 64))
 
 
 def _nvfp4(**kw):
-    return NVFP4Quantizer(bits=4, block_size=kw.get("block_size", 16),
+    return NVFP4Quantizer(bits=4, block_size=kw.get("nvfp4_block_size", 16),
                           fp8_scale=kw.get("fp8_scale", True))
 
 
 def _codebook3(**kw):
-    return LearnedCodebookQuantizer(bits=3, n_iters=kw.get("n_iters", 20),
-                                    seed=kw.get("seed", 0))
+    return LearnedCodebookQuantizer(bits=3, block_size=kw.get("cb_block_size", 64),
+                                    n_iters=kw.get("n_iters", 20), seed=kw.get("seed", 0))
 
 
 def _codebook4(**kw):
-    return LearnedCodebookQuantizer(bits=4, n_iters=kw.get("n_iters", 20),
-                                    seed=kw.get("seed", 0))
+    return LearnedCodebookQuantizer(bits=4, block_size=kw.get("cb_block_size", 64),
+                                    n_iters=kw.get("n_iters", 20), seed=kw.get("seed", 0))
 
 
 QUANTIZER_REGISTRY = {
@@ -56,24 +60,15 @@ QUANTIZER_REGISTRY = {
 
 
 def get_quantizer(name: str, **kwargs) -> BaseQuantizer:
-    """Factory: resolve a quantizer name to a BaseQuantizer instance."""
     key = name.lower()
     if key not in QUANTIZER_REGISTRY:
-        raise ValueError(
-            f"Unknown quantizer {name!r}. Available: {sorted(QUANTIZER_REGISTRY)}"
-        )
+        raise ValueError(f"Unknown quantizer {name!r}. Available: {sorted(QUANTIZER_REGISTRY)}")
     return QUANTIZER_REGISTRY[key](**kwargs)
 
 
 __all__ = [
-    "BaseQuantizer",
-    "QuantResult",
-    "NormalFloatQuantizer",
-    "NVFP4Quantizer",
-    "LearnedCodebookQuantizer",
-    "apply_ncc",
-    "NCCStats",
-    "james_stein_mean",
-    "get_quantizer",
-    "QUANTIZER_REGISTRY",
+    "BaseQuantizer", "QuantResult",
+    "NormalFloatQuantizer", "NVFP4Quantizer", "LearnedCodebookQuantizer",
+    "apply_ncc", "NCCStats", "james_stein_mean",
+    "get_quantizer", "QUANTIZER_REGISTRY",
 ]

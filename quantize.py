@@ -120,6 +120,7 @@ def quantize_model(
     skip_lmhead: bool = True,
     n_calib: int = 128,
     max_length: int = 512,
+    row_chunk: int = 1024,
 ):
     # Gather target Linear layers.
     linears = [(n, m) for n, m in model.named_modules() if isinstance(m, nn.Linear)]
@@ -159,7 +160,7 @@ def quantize_model(
     bias_after_sum = 0.0
     for n, module in linears:
         W = module.weight.data
-        res = quantizer.quantize(W)
+        res = quantizer.quantize(W, row_chunk=row_chunk)
         W_out = res.W_dequant
 
         if use_ncc and n in means:
@@ -170,6 +171,7 @@ def quantize_model(
             W_out, stats = apply_ncc(
                 W_fp=W, qres=res, mu=mu,
                 budget_p=budget_p, use_james_stein=True, mu_var=mu_var,
+                row_chunk=row_chunk,
             )
             total_flips += stats.flips
             bias_before_sum += stats.bias_before
@@ -206,9 +208,13 @@ def main():
     p.add_argument("--calib-dataset", type=str, default="wikitext2-simple",
                    choices=["wikitext2-simple"])
     p.add_argument("--seed", type=int, default=42)
-    # quantizer-specific knobs
-    p.add_argument("--block-size", type=int, default=16, help="NVFP4 micro-block size")
+    # quantizer-specific knobs (block = standard non-uniform scaling granularity)
+    p.add_argument("--nf-block-size", type=int, default=64, help="NF3/NF4 block size (bnb default 64)")
+    p.add_argument("--nvfp4-block-size", type=int, default=16, help="NVFP4 micro-block size")
+    p.add_argument("--cb-block-size", type=int, default=64, help="learned-codebook block size")
     p.add_argument("--kmeans-iters", type=int, default=20, help="learned-codebook k-means iters")
+    p.add_argument("--row-chunk", type=int, default=1024,
+                   help="output rows processed at once (memory bound; no effect on result)")
     args = p.parse_args()
 
     random.seed(args.seed)
@@ -234,7 +240,9 @@ def main():
 
     quantizer = get_quantizer(
         args.quantizer,
-        block_size=args.block_size,
+        nf_block_size=args.nf_block_size,
+        nvfp4_block_size=args.nvfp4_block_size,
+        cb_block_size=args.cb_block_size,
         n_iters=args.kmeans_iters,
         seed=args.seed,
     )
@@ -246,7 +254,7 @@ def main():
         model, tokenizer, quantizer, calib_texts, device,
         use_ncc=args.use_ncc, budget_p=args.budget_p,
         skip_lmhead=args.skip_lmhead, n_calib=args.n_calib,
-        max_length=args.max_length,
+        max_length=args.max_length, row_chunk=args.row_chunk,
     )
 
     os.makedirs(args.output_dir, exist_ok=True)

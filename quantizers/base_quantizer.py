@@ -1,37 +1,35 @@
 """
-Base interface for non-uniform per-channel scalar codebook quantizers.
+Base interface for non-uniform per-block scalar codebook quantizers.
 
-A quantizer in this package follows the NCC abstraction (Non-uniform Codebook
-Correction, Sec. 3.1): each output channel j is quantized with its own strictly
-increasing scalar codebook
+This package follows the *deployed* standard for non-uniform weight-only PTQ:
 
-    C_j = { c_{j,0} < c_{j,1} < ... < c_{j,L-1} }.
+    fixed per-format level shape  x  per-BLOCK scale,
 
-For NF / float formats the codebook factorises as a fixed canonical shape scaled
-per channel:  c_{j,l} = s_j * q_l, with {q_l} dense near 0 and sparse in the tails.
-Learned codebooks drop even this structure (the levels are searched per channel).
+where a block is a short contiguous run of weights along the input dimension that
+shares one scale (the same idea as "group_size" in uniform GPTQ/AWQ). The fixed
+level shape is what makes the format non-uniform:
+    - NF3/NF4 : normal-quantile levels (dense near 0)
+    - NVFP4   : E2M1 float levels
+    - learned : per-block k-means levels (no fixed shape)
+Standard block sizes: NF=64 (bitsandbytes), NVFP4=16 (NVIDIA), learned=64.
 
-The base quantizer is responsible only for the *base* operation: given a weight
-matrix W [out, in], produce
-    - the assigned indices  L(i,j)
-    - the dequantized weight Wq = c_{j, L(i,j)}
-    - the per-channel codebook levels (so NCC can read neighbouring codewords).
+This matches the NCC paper's setup (Sec. 3.1): each weight is assigned to a scalar
+codebook; for factorised formats the codebook is scale * {q_l}. The only change
+from a per-channel codebook to a per-block codebook is that the scale (hence the
+realised levels and the local gaps NCC reads) varies per block rather than per
+row. NCC handles this via the realised neighbour query, exactly as it already
+does for NVFP4.
 
-It deliberately knows nothing about NCC's first-moment correction; NCC consumes
-the codebook + indices afterwards.
-
-Convention on layout
----------------------
-Throughout this package "channel" = output channel = a *row* of the
-nn.Linear weight (shape [out_features, in_features]). The codebook is built per
-output channel (per row). This matches the NCC setup where each channel j owns a
-codebook C_j and the activation x is shared across channels.
+Layout convention
+-----------------
+"channel" = output channel = a ROW of nn.Linear weight [out_features, in_features].
+Blocks partition the INPUT dimension (columns). Each (row, block) owns a scale.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
@@ -39,110 +37,113 @@ import torch
 
 @dataclass
 class QuantResult:
-    """Result of quantizing a single weight matrix.
+    """Result of quantizing a single weight matrix W [out, in].
 
     Attributes
     ----------
-    W_dequant : torch.Tensor          [out, in]
-        The dequantized weights Wq = c_{j, L(i,j)} (same dtype as input W).
-    indices : torch.Tensor            [out, in]  (long)
-        Per-weight codeword index L(i,j) into the per-channel codebook.
-    codebook : torch.Tensor           [out, L]
-        The realised per-channel scalar codebook C_j (row j is channel j's
-        sorted levels). For factorised formats this is scale_j * q. Strictly
-        increasing along dim=1.
-    scale : Optional[torch.Tensor]    [out, 1]
-        Per-channel scale s_j when the format factorises (NF/float). None for
-        purely learned codebooks that do not factorise.
+    W_dequant : [out, in]
+        Dequantized weights Wq (same dtype as input W).
+    indices : [out, in] long
+        Per-weight codeword index into that weight's *block* codebook.
+    q_levels : [L]
+        Canonical normalised level shape (max|level| = 1). Shared across blocks;
+        the realised levels for block b are block_scales[:, b] * q_levels.
+    block_scales : [out, n_blocks]
+        Per-(row, block) scale s_{j,b}. Realised codebook for weight (i in block b
+        of row j) is block_scales[j, b] * q_levels.
+    block_size : int
+        Number of input columns per block.
+    block_codebooks : Optional[[out, n_blocks, L]]
+        Materialised realised levels per (row, block) when a format does not
+        factorise as scale*shape (learned codebooks). When None, reconstruct as
+        block_scales[:, b, None] * q_levels.
     """
 
     W_dequant: torch.Tensor
     indices: torch.Tensor
-    codebook: torch.Tensor
-    scale: Optional[torch.Tensor] = None
+    q_levels: torch.Tensor
+    block_scales: torch.Tensor
+    block_size: int
+    block_codebooks: Optional[torch.Tensor] = None
 
 
 class BaseQuantizer(ABC):
-    """Abstract per-channel scalar-codebook quantizer.
+    """Abstract non-uniform per-block scalar-codebook quantizer.
 
-    Subclasses implement `build_codebook` (the per-channel level set) and inherit
-    a shared nearest-codeword `quantize`. Learned codebooks may override
-    `quantize` if assignment is not a simple nearest search, but the default
-    nearest-codeword assignment matches every format in this package.
+    Subclasses provide the canonical level shape via `q_levels` (an attribute or
+    property returning a 1-D normalised tensor) and inherit the shared block-wise
+    nearest-codeword `quantize`. Learned codebooks override `quantize` because
+    their levels are searched per block rather than being a fixed shape.
     """
 
     name: str = "base"
 
-    def __init__(self, bits: int, per_channel: bool = True):
+    def __init__(self, bits: int, block_size: int = 64):
         self.bits = bits
-        self.per_channel = per_channel
-        if not per_channel:
-            # The whole package (and NCC) assumes per-channel codebooks.
-            raise ValueError("Only per-channel codebooks are supported.")
+        self.block_size = block_size
 
     # ------------------------------------------------------------------ #
     # Subclass contract
     # ------------------------------------------------------------------ #
+    @property
     @abstractmethod
-    def build_codebook(self, W: torch.Tensor) -> QuantResult:
-        """Build the per-channel codebook C_j for weight matrix W [out, in].
-
-        Must return a QuantResult with `codebook` filled and `W_dequant` /
-        `indices` *empty placeholders allowed* — the default `quantize` below
-        fills them. In practice subclasses just compute the levels here and let
-        `quantize` do the assignment. Strictly increasing levels per row are
-        required (NCC reads left/right neighbours).
-        """
+    def q_levels(self) -> torch.Tensor:
+        """Canonical level shape, 1-D, sorted ascending, normalised max|q| = 1."""
         raise NotImplementedError
 
     # ------------------------------------------------------------------ #
-    # Shared nearest-codeword assignment
+    # Shared block-wise nearest-codeword assignment (factorised formats)
     # ------------------------------------------------------------------ #
     @torch.no_grad()
-    def quantize(self, W: torch.Tensor) -> QuantResult:
-        """Quantize W [out, in] by nearest-codeword assignment on C_j.
+    def quantize(self, W: torch.Tensor, row_chunk: int = 1024) -> QuantResult:
+        """Block-wise nearest-codeword quantization of W [out, in].
 
-        Returns the full QuantResult (dequantized weights, indices, codebook,
-        scale). This is the "base quantizer" end-of-pipeline discrete decision
-        that NCC later corrects.
+        Scale is per (row, block) absmax: s_{j,b} = max|W in block| / max|q|, so
+        the extreme level reaches the block's largest-magnitude weight. Processed
+        in row chunks to bound the transient [chunk, in, L] tensor (OOM-safe;
+        result is bit-identical regardless of chunk size since rows are
+        independent).
         """
-        res = self.build_codebook(W)
-        codebook = res.codebook  # [out, L]
-        out_features, L = codebook.shape
+        device = W.device
+        out_features, in_features = W.shape
+        q = self.q_levels.to(device).float()                 # [L]
+        L = q.numel()
+        qmax = q.abs().max().clamp(min=1e-12)
+        bs = self.block_size
+        n_blocks = (in_features + bs - 1) // bs
 
-        # Nearest-codeword index per weight.
-        # W: [out, in] -> [out, in, 1]; codebook: [out, L] -> [out, 1, L].
-        # Distance |W - c|, argmin over L. Computed in float32 for stability.
-        Wf = W.float()
-        diff = (Wf.unsqueeze(-1) - codebook.float().unsqueeze(1)).abs()  # [out, in, L]
-        indices = diff.argmin(dim=-1)  # [out, in]
-        del diff
+        W_dequant = torch.empty_like(W)
+        indices = torch.empty(out_features, in_features, dtype=torch.long, device=device)
+        block_scales = torch.empty(out_features, n_blocks, device=device, dtype=torch.float32)
 
-        # Gather the assigned levels back into a dequantized weight.
-        W_dequant = torch.gather(codebook, 1, indices)  # [out, in]
-        W_dequant = W_dequant.to(W.dtype)
+        for r0 in range(0, out_features, row_chunk):
+            r1 = min(r0 + row_chunk, out_features)
+            Wr = W[r0:r1].float()                              # [rc, in]
+            rc = r1 - r0
+            for b in range(n_blocks):
+                c0 = b * bs
+                c1 = min(c0 + bs, in_features)
+                Wb = Wr[:, c0:c1]                              # [rc, bw]
+                absmax = Wb.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)  # [rc,1]
+                scale = absmax / qmax                          # [rc,1]
+                block_scales[r0:r1, b] = scale.squeeze(1)
+
+                grid = scale * q.unsqueeze(0)                  # [rc, L]
+                diff = (Wb.unsqueeze(-1) - grid.unsqueeze(1)).abs()  # [rc, bw, L]
+                idx = diff.argmin(dim=-1)                      # [rc, bw]
+                deq = torch.gather(grid, 1, idx)               # [rc, bw]
+                W_dequant[r0:r1, c0:c1] = deq.to(W.dtype)
+                indices[r0:r1, c0:c1] = idx
+                del diff, grid
 
         return QuantResult(
             W_dequant=W_dequant,
             indices=indices,
-            codebook=codebook,
-            scale=res.scale,
+            q_levels=q,
+            block_scales=block_scales,
+            block_size=bs,
+            block_codebooks=None,   # factorised: reconstruct scale * q on demand
         )
 
-    # ------------------------------------------------------------------ #
-    # Helpers shared by factorised (NF / float) formats
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _per_channel_absmax_scale(W: torch.Tensor, q_levels: torch.Tensor) -> torch.Tensor:
-        """Per-row scale s_j s.t. the codebook spans the row's dynamic range.
-
-        For a canonical level set {q_l} normalised to max |q_l| = 1, choose
-        s_j = max_i |W_{i,j}| / max_l |q_l|. With normalised levels this is just
-        the per-row absmax, so the extreme codeword reaches the largest weight.
-        """
-        qmax = q_levels.abs().max().clamp(min=1e-12)
-        absmax = W.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)  # [out, 1]
-        return absmax / qmax
-
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(name={self.name!r}, bits={self.bits})"
+        return f"{self.__class__.__name__}(name={self.name!r}, bits={self.bits}, block_size={self.block_size})"
