@@ -18,8 +18,13 @@ python compare_slicing.py --heuristic-path ./quantized_models/llama3.1_nf4_ncc/ 
 
 python compare_slicing.py --heuristic-path ./quantized_models/llama3.1_nvfp4/ 
 
+Llama 3.1 
+Based Asym
+WikiText-2      Heuristic AWQ        5.8631          288,937        
+C4              Heuristic AWQ        9.4348          409,600        
 
 
+Based Symmetric
 Dataset         Heuristic AWQ (↓)  Standard AWQ (↓)   
 --------------------------------------------------------------------------------
 WikiText-2      5.8451          5.8737                   
