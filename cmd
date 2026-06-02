@@ -25,7 +25,7 @@ C4              Heuristic AWQ        9.4348          409,600
 
 
 Based Symmetric
-Dataset         Heuristic AWQ (↓)  Standard AWQ (↓)   
+Dataset         Correction (↓)  Standard  (↓)   
 --------------------------------------------------------------------------------
 WikiText-2      5.8451          5.8737                   
 C4              9.3916          9.4012                 
