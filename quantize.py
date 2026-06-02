@@ -45,7 +45,7 @@ from tqdm import tqdm
 
 import quantizers.base_quantizer as base_q
 from quantizers import get_quantizer, apply_ncc
-from bc import apply_bias_correction
+from quantizers.bc import apply_bias_correction
 
 
 # --------------------------------------------------------------------------- #
