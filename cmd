@@ -50,3 +50,10 @@ C4              Heuristic AWQ        9.4012          409,600
 Based Asym:
 WikiText-2      Heuristic AWQ        5.8631          288,937        
 C4              Heuristic AWQ        9.4348          409,600        
+
+Asym NCC
+Dataset         Model                Perplexity      Total Tokens   
+----------------------------------------------------------------------
+WikiText-2      Heuristic AWQ        5.8450          288,937        
+C4              Heuristic AWQ        9.4311          409,600        
+
