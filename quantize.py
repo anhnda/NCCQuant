@@ -29,7 +29,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-
+from tqdm import tqdm
 from quantizers import get_quantizer, apply_ncc
 
 
@@ -158,7 +158,7 @@ def quantize_model(
     total_flips = 0
     bias_before_sum = 0.0
     bias_after_sum = 0.0
-    for n, module in linears:
+    for n, module in tqdm(linears, desc="Quantizing layers"):
         W = module.weight.data
         res = quantizer.quantize(W, row_chunk=row_chunk)
         W_out = res.W_dequant
