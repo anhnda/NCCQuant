@@ -2,16 +2,17 @@
 NVFP4 codebook quantizer — block-wise E2M1 with FP8 micro-block scales (standard).
 
 NVFP4 = OCP E2M1 4-bit float grid (levels {0,±0.5,±1,±1.5,±2,±3,±4,±6}) with a
-per-16 micro-block scale rounded to FP8 (E4M3). This is already the deployed
-non-uniform standard for FP4, so it simply uses the shared block-wise assignment
-with block_size=16 and an FP8-rounded scale.
+per-16 micro-block scale rounded to FP8 (E4M3). Symmetric mode uses grid = s*q.
+Asymmetric mode (global ASYM flag) fits an affine (scale, zero) map of the E2M1
+span onto the block [min, max]; the scale is still FP8-rounded, and the realised
+per-block levels are materialised into block_codebooks for NCC.
 """
 
 from __future__ import annotations
 
 import torch
 
-from .base_quantizer import BaseQuantizer, QuantResult
+from .base_quantizer import BaseQuantizer, QuantResult, ASYM
 
 
 _E2M1_MAG = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
@@ -52,21 +53,33 @@ class NVFP4Quantizer(BaseQuantizer):
     def quantize(self, W: torch.Tensor, row_chunk: int = 1024) -> QuantResult:
         """Block-wise E2M1 assignment with FP8-rounded per-block scale.
 
-        Identical structure to the base block-wise quantize, but the per-(row,
-        block) scale is snapped to FP8 before building the grid. Row-chunked for
-        OOM safety.
+        Symmetric: scale = absmax / max|q|, grid = scale*q.
+        Asymmetric: scale = (wmax-wmin)/(qmax-qmin) (FP8-rounded), z = qlo - wmin/scale,
+        grid = scale*(q - z); realised levels stored in block_codebooks.
+        Row-chunked for OOM safety.
         """
         device = W.device
         out_features, in_features = W.shape
         q = self.q_levels.to(device).float()
         L = q.numel()
         qmax = q.abs().max().clamp(min=1e-12)
+        qlo = q.min()
+        qhi = q.max()
+        qspan = (qhi - qlo).clamp(min=1e-12)
         bs = self.block_size
         n_blocks = (in_features + bs - 1) // bs
 
         W_dequant = torch.empty_like(W)
         indices = torch.empty(out_features, in_features, dtype=torch.long, device=device)
         block_scales = torch.empty(out_features, n_blocks, device=device, dtype=torch.float32)
+        block_zeros = (
+            torch.zeros(out_features, n_blocks, device=device, dtype=torch.float32)
+            if ASYM else None
+        )
+        block_codebooks = (
+            torch.zeros(out_features, n_blocks, L, device=device, dtype=torch.float32)
+            if ASYM else None
+        )
 
         for r0 in range(0, out_features, row_chunk):
             r1 = min(r0 + row_chunk, out_features)
@@ -75,13 +88,26 @@ class NVFP4Quantizer(BaseQuantizer):
                 c0 = b * bs
                 c1 = min(c0 + bs, in_features)
                 Wb = Wr[:, c0:c1]
-                absmax = Wb.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
-                scale = absmax / qmax
-                if self.fp8_scale:
-                    scale = self._round_e4m3(scale)
-                block_scales[r0:r1, b] = scale.squeeze(1)
 
-                grid = scale * q.unsqueeze(0)
+                if ASYM:
+                    wmin = Wb.amin(dim=1, keepdim=True)
+                    wmax = Wb.amax(dim=1, keepdim=True)
+                    scale = ((wmax - wmin) / qspan).clamp(min=1e-12)
+                    if self.fp8_scale:
+                        scale = self._round_e4m3(scale)
+                    z = qlo - wmin / scale
+                    block_scales[r0:r1, b] = scale.squeeze(1)
+                    block_zeros[r0:r1, b] = z.squeeze(1)
+                    grid = scale * (q.unsqueeze(0) - z)        # [rc, L]
+                    block_codebooks[r0:r1, b, :] = grid
+                else:
+                    absmax = Wb.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
+                    scale = absmax / qmax
+                    if self.fp8_scale:
+                        scale = self._round_e4m3(scale)
+                    block_scales[r0:r1, b] = scale.squeeze(1)
+                    grid = scale * q.unsqueeze(0)
+
                 diff = (Wb.unsqueeze(-1) - grid.unsqueeze(1)).abs()
                 idx = diff.argmin(dim=-1)
                 deq = torch.gather(grid, 1, idx)
@@ -95,5 +121,6 @@ class NVFP4Quantizer(BaseQuantizer):
             q_levels=q,
             block_scales=block_scales,
             block_size=bs,
-            block_codebooks=None,
+            block_codebooks=block_codebooks,
+            block_zeros=block_zeros,
         )

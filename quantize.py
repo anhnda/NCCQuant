@@ -30,8 +30,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
+# near the top imports
+import quantizers.base_quantizer as base_q
 from quantizers import get_quantizer, apply_ncc
-
 
 # --------------------------------------------------------------------------- #
 # Calibration data
@@ -215,7 +216,15 @@ def main():
     p.add_argument("--kmeans-iters", type=int, default=20, help="learned-codebook k-means iters")
     p.add_argument("--row-chunk", type=int, default=1024,
                    help="output rows processed at once (memory bound; no effect on result)")
+    # in main(), add to the argparser:
+    p.add_argument("--asym", dest="asym", action="store_true", default=True,
+                   help="Asymmetric (affine min/max) quantization (default: True)")
+    p.add_argument("--no-asym", dest="asym", action="store_false",
+                   help="Symmetric (absmax) quantization")
     args = p.parse_args()
+    # in main(), right after args = p.parse_args() and seeding, BEFORE get_quantizer:
+    base_q.ASYM = args.asym
+    print(f"ASYM mode: {base_q.ASYM}")
 
     random.seed(args.seed)
     np.random.seed(args.seed)

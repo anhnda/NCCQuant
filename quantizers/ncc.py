@@ -77,16 +77,16 @@ def james_stein_mean(x_bar: torch.Tensor, var: Optional[torch.Tensor] = None) ->
 def _block_realised_levels(qres: QuantResult, r0: int, r1: int, device) -> torch.Tensor:
     """Realised level grid for rows [r0:r1], shape [rc, n_blocks, L].
 
-    Factorised formats: block_scales[:, :, None] * q_levels[None, None, :].
-    Learned formats: read block_codebooks directly.
+    Asym factorised / learned formats: block_codebooks holds the realised levels
+    directly (asym = scale*(q - z) materialised at quantize time).
+    Symmetric factorised formats (block_codebooks is None): reconstruct as
+    block_scales[:, :, None] * q_levels[None, None, :].
     """
     if qres.block_codebooks is not None:
         return qres.block_codebooks[r0:r1].to(device).float()
     q = qres.q_levels.to(device).float()                       # [L]
     bscale = qres.block_scales[r0:r1].to(device).float()       # [rc, n_blocks]
     return bscale.unsqueeze(-1) * q.view(1, 1, -1)             # [rc, n_blocks, L]
-
-
 @torch.no_grad()
 def apply_ncc(
     W_fp: torch.Tensor,

@@ -2,14 +2,9 @@
 Learned scalar codebook quantizer: Codebook3 / Codebook4 — block-wise (standard).
 
 A learned codebook drops the fixed shape: the 2**bits levels are searched from the
-weights themselves. The standard deployment (AQLM / GPTVQ family) learns levels
-per BLOCK, not per whole row. We learn each (row, block) codebook by 1-D k-means
-(Lloyd) on that block's weights. Levels do NOT factorise as scale*shape, so the
-realised levels are stored in `block_codebooks` [out, n_blocks, K] for NCC to read
-neighbours from directly (sorted-array neighbour query).
-
-Row-chunked for OOM safety. Within a chunk, all blocks of those rows are learned
-with vectorised Lloyd iterations.
+weights themselves by 1-D k-means (Lloyd) per (row, block). This is inherently
+asymmetric — centers are free to sit anywhere — so the global ASYM flag does not
+change it. Realised levels are stored in block_codebooks for NCC to read.
 """
 
 from __future__ import annotations
@@ -87,7 +82,6 @@ class LearnedCodebookQuantizer(BaseQuantizer):
         W_dequant = torch.empty_like(W)
         indices = torch.empty(out_features, in_features, dtype=torch.long, device=device)
         block_codebooks = torch.zeros(out_features, n_blocks, K, device=device, dtype=torch.float32)
-        # block_scales kept for interface uniformity (per-block absmax, informational).
         block_scales = torch.zeros(out_features, n_blocks, device=device, dtype=torch.float32)
 
         for r0 in range(0, out_features, row_chunk):
@@ -116,4 +110,5 @@ class LearnedCodebookQuantizer(BaseQuantizer):
             block_scales=block_scales,
             block_size=bs,
             block_codebooks=block_codebooks,   # realised per-(row,block) levels
+            block_zeros=None,                  # centers already encode any shift
         )
