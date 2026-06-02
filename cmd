@@ -22,6 +22,11 @@ python compare_slicing.py --heuristic-path ./quantized_models/llama3.1_nvfp4/
 
 Dataset         Heuristic AWQ   Standard AWQ    Delta        Winner    
 --------------------------------------------------------------------------------
-WikiText-2      5.8776          5.8737               +0.067%  Tie       
-C4              9.4109          9.4012               +0.103%  Tie       
+WikiText-2      5.8451          5.8737               +0.067%  Tie       
+C4              9.3916          9.4012               +0.103%  Tie       
 
+
+
+
+python quantize.py --model-path /home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b --quantizer nf4 --output-dir ./quantized_models/llama3.1_nf4_ncc
+python compare_slicing.py --heuristic-path ./quantized_models/llama3.1_nf4_ncc/
