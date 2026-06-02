@@ -12,6 +12,16 @@ Per-move first-moment change uses gap g read per block; selection is the
 sign-aligned, gap-aware eta = |mu_i|/g ordering with greedy prefix under budget
 B_j = ceil(p |A_j|). Empty selection is always feasible => Prop. 1 descent.
 
+Degenerate-gap guard (Assumption 2, strict g>0). A complementary move whose gap
+g_{i,j} is (near) zero corrects |v_{i,j}| = |mu_i| g ~ 0 first-moment error by the
+method's own per-move equation, yet eta = |mu_i|/g -> infinity sends it to the top
+of the ordering and lets it consume a budget slot for no progress. Assumption 2
+already requires 0 < g_{i,j} <= g_max strictly; we make that numerically real with
+an absolute floor `gap_floor`, so degenerate / coincident codewords (common in
+learned tables and at NF level boundaries) are simply not feasible moves. This is a
+feasibility cleanup, not a new ranking criterion: the eta ordering remains the sole
+selection rule, so Prop. 1 (descent) and Thm A/B are untouched.
+
 Memory: processed in row chunks; within a chunk we reconstruct realised levels
 [rc, n_blocks, L] (or read learned block_codebooks) and the per-weight neighbour
 gaps [rc, in]. No [out, in, L] tensor is ever held for the whole matrix.
@@ -34,10 +44,24 @@ class NCCStats:
     bias_before: float
     bias_after: float
     channels: int
+    # Diagnostics: total first-moment error actually removed by the selected
+    # flips (sum |v| over chosen moves) and the smallest selected per-move
+    # correction. If `min_selected_abs_v` is ~0, the budget was being spent on
+    # zero-progress (degenerate-gap) flips — the bug the gap floor fixes.
+    sum_selected_abs_v: float = 0.0
+    min_selected_abs_v: float = float("inf")
+    num_degenerate_dropped: int = 0
 
 
 def james_stein_mean(x_bar: torch.Tensor, var: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """James-Stein shrinkage of the sample mean toward its global mean (Sec 3.5)."""
+    """James-Stein shrinkage of the sample mean toward its global mean (Sec 3.5).
+
+    Off by default in apply_ncc: with m >> d (calibration tokens >> input dim) the
+    sample mean is not in the regime JS was built for, and the gap-aware ranking
+    (not a threshold) does not need it. Kept for the ablation row only. NOTE: `var`
+    must be the variance OF THE MEAN ESTIMATE (activation variance / m), not the raw
+    activation variance, or the shrink factor is inflated by ~m and collapses mu.
+    """
     mu0 = x_bar.mean()
     d = x_bar.numel()
     if d < 3:
@@ -72,6 +96,8 @@ def apply_ncc(
     use_james_stein: bool = False,
     mu_var: Optional[torch.Tensor] = None,
     row_chunk: int = 1024,
+    gap_floor: float = 1e-8,
+    gap_floor_rel: float = 0.0,
 ) -> tuple[torch.Tensor, NCCStats]:
     """Run block-aware NCC; return corrected dequant weights + stats.
 
@@ -82,6 +108,15 @@ def apply_ncc(
     mu   : [in] per-input-channel activation mean.
     budget_p : budget fraction p in (0,1].
     row_chunk : rows processed at once (memory bound; no effect on result).
+    gap_floor : absolute lower bound on a feasible complementary gap. Enforces the
+        strict g>0 of Assumption 2 numerically and removes degenerate / coincident
+        codewords (|v| ~ 0 yet eta -> inf). Keep this an *absolute* machine-scale
+        guard; it is a feasibility condition, not a hyperparameter.
+    gap_floor_rel : OPTIONAL relative floor as a fraction of the per-row median gap.
+        Default 0 (disabled). WARNING: a meaningful relative floor would exclude
+        genuine narrow *centre* cells — exactly where Thm B says corrections are
+        cheapest and safest — so it contradicts the theory. Leave at 0 unless you
+        specifically want that ablation.
     """
     device = W_fp.device
     out_features, in_features = W_fp.shape
@@ -99,6 +134,9 @@ def apply_ncc(
     total_flips = 0
     bias_before = 0.0
     bias_after = 0.0
+    sum_selected_abs_v = 0.0
+    min_selected_abs_v = float("inf")
+    num_degenerate_dropped = 0
 
     # Column -> block id map (last block may be short).
     col_block = torch.arange(in_features, device=device) // bs   # [in]
@@ -138,13 +176,32 @@ def apply_ncc(
         target_val = torch.where(move_down, left, right)
         feasible = torch.where(move_down, idx > 0, idx < (L - 1))
 
+        # Degenerate-gap guard (Assumption 2: strict g>0). Absolute floor, plus an
+        # optional (default-off) relative floor for ablations only.
+        floor = gap.new_full((), gap_floor)
+        if gap_floor_rel > 0.0:
+            # per-row median over feasible, positive gaps
+            gpos = torch.where(feasible & (gap > gap_floor), gap, torch.full_like(gap, float("nan")))
+            med = torch.nanmedian(gpos, dim=1, keepdim=True).values  # [rc,1]
+            med = torch.nan_to_num(med, nan=gap_floor)
+            rel = gap_floor_rel * med
+            gap_ok = gap > torch.maximum(floor, rel)
+        else:
+            gap_ok = gap > floor
+
         # v = mu * sign(e) * g (first-moment corrected per move).
         v = mu.unsqueeze(0) * e_sign * gap              # [rc, in]
         # Sign filter (Eq.5): sign(mu) == sign(e*b).
         sign_ok = torch.sign(mu).unsqueeze(0) == torch.sign(e_sign * b.unsqueeze(1))
-        admissible = feasible & sign_ok & (gap > 0)
-        # eta = |mu|/g ordering (Eq.9).
-        eta = mu.abs().unsqueeze(0) / gap.clamp(min=1e-12)
+
+        # Track how many would-be candidates we drop purely for degenerate gap.
+        would_admit = feasible & sign_ok
+        num_degenerate_dropped += int((would_admit & ~gap_ok).sum().item())
+
+        admissible = feasible & sign_ok & gap_ok
+        # eta = |mu|/g ordering (Eq.9). Floor the denominator at the *same* feasible
+        # floor so a surviving candidate's eta cannot be inflated by a sub-floor gap.
+        eta = mu.abs().unsqueeze(0) / gap.clamp(min=gap_floor)
         eta = torch.where(admissible, eta, torch.full_like(eta, -1.0))
         order = torch.argsort(eta, dim=1, descending=True)   # [rc, in]
 
@@ -174,10 +231,25 @@ def apply_ncc(
             b_new = bj - float(cumv[k_star - 1].item())
             bias_after += b_new * b_new
 
+            # Diagnostics on the selected flips.
+            sel_abs_v = v[rr, chosen].abs()
+            sum_selected_abs_v += float(sel_abs_v.sum().item())
+            min_selected_abs_v = min(min_selected_abs_v, float(sel_abs_v.min().item()))
+
         del e, e_sign, gap, v, eta, order, levels, cur, left, right
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    stats = NCCStats(flips=total_flips, bias_before=bias_before,
-                     bias_after=bias_after, channels=out_features)
+    if min_selected_abs_v == float("inf"):
+        min_selected_abs_v = 0.0
+
+    stats = NCCStats(
+        flips=total_flips,
+        bias_before=bias_before,
+        bias_after=bias_after,
+        channels=out_features,
+        sum_selected_abs_v=sum_selected_abs_v,
+        min_selected_abs_v=min_selected_abs_v,
+        num_degenerate_dropped=num_degenerate_dropped,
+    )
     return Wq_corr.to(W_fp.dtype), stats
