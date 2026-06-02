@@ -77,16 +77,16 @@ def james_stein_mean(x_bar: torch.Tensor, var: Optional[torch.Tensor] = None) ->
 def _block_realised_levels(qres: QuantResult, r0: int, r1: int, device) -> torch.Tensor:
     """Realised level grid for rows [r0:r1], shape [rc, n_blocks, L].
 
-    Asym factorised / learned formats: block_codebooks holds the realised levels
-    directly (asym = scale*(q - z) materialised at quantize time).
-    Symmetric factorised formats (block_codebooks is None): reconstruct as
-    block_scales[:, :, None] * q_levels[None, None, :].
+    Factorised formats: block_scales[:, :, None] * q_levels[None, None, :].
+    Learned formats: read block_codebooks directly.
     """
     if qres.block_codebooks is not None:
         return qres.block_codebooks[r0:r1].to(device).float()
     q = qres.q_levels.to(device).float()                       # [L]
     bscale = qres.block_scales[r0:r1].to(device).float()       # [rc, n_blocks]
     return bscale.unsqueeze(-1) * q.view(1, 1, -1)             # [rc, n_blocks, L]
+
+
 @torch.no_grad()
 def apply_ncc(
     W_fp: torch.Tensor,
@@ -98,6 +98,9 @@ def apply_ncc(
     row_chunk: int = 1024,
     gap_floor: float = 1e-8,
     gap_floor_rel: float = 0.0,
+    score: str = "lite",
+    sigma_ii: Optional[torch.Tensor] = None,
+    cov_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, NCCStats]:
     """Run block-aware NCC; return corrected dequant weights + stats.
 
@@ -114,9 +117,16 @@ def apply_ncc(
         guard; it is a feasibility condition, not a hyperparameter.
     gap_floor_rel : OPTIONAL relative floor as a fraction of the per-row median gap.
         Default 0 (disabled). WARNING: a meaningful relative floor would exclude
-        genuine narrow *centre* cells — exactly where Thm B says corrections are
-        cheapest and safest — so it contradicts the theory. Leave at 0 unless you
-        specifically want that ablation.
+        genuine narrow *centre* cells — exactly where the certificate says
+        corrections are cheapest and safest — so it contradicts the theory. Leave
+        at 0 unless you specifically want that ablation.
+    score : "lite" -> eta = |mu_i| / g_{i,j}  (covariance-free; NCC-Lite).
+            "cov"  -> eta = |mu_i| / ((sigma_ii + cov_eps) * g_{i,j})  (NCC-Cov),
+            the rule derived from the diagonal bias-variance surrogate
+            (bias progress |mu_i| g over diagonal variance cost sigma_ii g^2).
+    sigma_ii : [in] per-input-channel activation variance (diag of Sigma). Required
+        for score="cov"; ignored for "lite".
+    cov_eps : small constant added to sigma_ii to avoid division blow-up.
     """
     device = W_fp.device
     out_features, in_features = W_fp.shape
@@ -126,6 +136,13 @@ def apply_ncc(
     mu = mu.to(device).float()
     if use_james_stein:
         mu = james_stein_mean(mu, mu_var.to(device).float() if mu_var is not None else None)
+
+    if score not in ("lite", "cov"):
+        raise ValueError(f"score must be 'lite' or 'cov', got {score!r}")
+    if score == "cov":
+        if sigma_ii is None:
+            raise ValueError("score='cov' requires sigma_ii (per-input-channel variance)")
+        sigma_ii = sigma_ii.to(device).float()  # [in]
 
     Wq_full = qres.W_dequant.to(device).float()
     indices_full = qres.indices.to(device)
@@ -199,9 +216,14 @@ def apply_ncc(
         num_degenerate_dropped += int((would_admit & ~gap_ok).sum().item())
 
         admissible = feasible & sign_ok & gap_ok
-        # eta = |mu|/g ordering (Eq.9). Floor the denominator at the *same* feasible
-        # floor so a surviving candidate's eta cannot be inflated by a sub-floor gap.
-        eta = mu.abs().unsqueeze(0) / gap.clamp(min=gap_floor)
+        # eta ordering. Floor the denominator at the *same* feasible floor so a
+        # surviving candidate's eta cannot be inflated by a sub-floor gap.
+        # lite: eta = |mu| / g ; cov: eta = |mu| / ((sigma_ii+eps) * g).
+        if score == "cov":
+            denom = (sigma_ii.unsqueeze(0) + cov_eps) * gap.clamp(min=gap_floor)
+        else:
+            denom = gap.clamp(min=gap_floor)
+        eta = mu.abs().unsqueeze(0) / denom
         eta = torch.where(admissible, eta, torch.full_like(eta, -1.0))
         order = torch.argsort(eta, dim=1, descending=True)   # [rc, in]
 
@@ -253,3 +275,108 @@ def apply_ncc(
         num_degenerate_dropped=num_degenerate_dropped,
     )
     return Wq_corr.to(W_fp.dtype), stats
+
+
+@torch.no_grad()
+def per_cell_shift_validation(
+    W_fp: torch.Tensor,
+    qres: QuantResult,
+    log_density_grad: Optional[torch.Tensor] = None,
+    row_chunk: int = 1024,
+) -> dict:
+    """Validation data for the asymmetric-cell residual-bias theorem.
+
+    For every codeword cell that has both neighbours present, returns the realised
+    mean residual E[c - w | cell] alongside the theoretical prediction
+        pred = -(g+ - g-)/4  -  (g- + g+)^2 / 48 * (log f)'(c),
+    so a scatter / regression of realised vs predicted validates the theorem and
+    separates the geometric term from the curvature term.
+
+    Parameters
+    ----------
+    W_fp : [out, in] full-precision weights.
+    qres : QuantResult (indices, block info, level grid).
+    log_density_grad : optional callable-free tensor of (log f)'(c) per codeword.
+        Two accepted forms:
+          - None: only the geometric term is used (curvature term set to 0); useful
+            to isolate how much of the shift is pure cell asymmetry.
+          - [L] or [n_blocks, L]: (log f)'(c) evaluated at each codeword level.
+        If a per-channel learned density is unavailable, a fitted log-concave model
+        (e.g. Laplace/GG) on the layer's weights can supply (log f)'.
+
+    Returns
+    -------
+    dict with flat 1-D tensors over all qualifying cells:
+        'g_minus', 'g_plus', 'c', 'realized', 'pred_geom', 'pred_curv', 'pred',
+        'count' (weights per cell). Aggregate with weighting by 'count'.
+    """
+    device = W_fp.device
+    out_features, in_features = W_fp.shape
+    bs = qres.block_size
+    n_blocks = (in_features + bs - 1) // bs
+    col_block = torch.arange(in_features, device=device) // bs
+
+    g_minus_all, g_plus_all, c_all = [], [], []
+    realized_all, count_all = [], []
+    pred_curv_all = []
+
+    Wq_full = qres.W_dequant.to(device).float()
+    indices_full = qres.indices.to(device)
+
+    for r0 in range(0, out_features, row_chunk):
+        r1 = min(r0 + row_chunk, out_features)
+        rc = r1 - r0
+        Wr = W_fp[r0:r1].float()
+        Wq = Wq_full[r0:r1]
+        idx = indices_full[r0:r1]
+        levels = _block_realised_levels(qres, r0, r1, device)   # [rc, n_blocks, L]
+        L = levels.shape[-1]
+
+        blk = col_block.view(1, in_features, 1).expand(rc, in_features, L)
+        levels_per_w = torch.gather(levels, 1, blk)            # [rc, in, L]
+        cur = torch.gather(levels_per_w, 2, idx.unsqueeze(-1)).squeeze(-1)
+        left_idx = (idx - 1).clamp(min=0)
+        right_idx = (idx + 1).clamp(max=L - 1)
+        left = torch.gather(levels_per_w, 2, left_idx.unsqueeze(-1)).squeeze(-1)
+        right = torch.gather(levels_per_w, 2, right_idx.unsqueeze(-1)).squeeze(-1)
+        del levels_per_w, blk
+
+        gm = (cur - left).abs()
+        gp = (right - cur).abs()
+        e = cur - Wr                                           # residual c - w
+        both = (idx > 0) & (idx < (L - 1))                     # interior cells only
+
+        # curvature prediction term, if (log f)'(c) supplied
+        if log_density_grad is not None:
+            lg = log_density_grad.to(device).float()
+            if lg.dim() == 1:                                  # [L]
+                lg_per_w = lg[idx]                             # [rc, in]
+            else:                                             # [n_blocks, L]
+                lg_blk = lg[col_block]                         # [in, L]
+                lg_per_w = torch.gather(
+                    lg_blk.unsqueeze(0).expand(rc, in_features, L),
+                    2, idx.unsqueeze(-1)).squeeze(-1)
+            pred_curv = -((gm + gp) ** 2) / 48.0 * lg_per_w
+        else:
+            pred_curv = torch.zeros_like(e)
+
+        m = both
+        g_minus_all.append(gm[m]); g_plus_all.append(gp[m]); c_all.append(cur[m])
+        realized_all.append(e[m]); pred_curv_all.append(pred_curv[m])
+        count_all.append(torch.ones_like(e[m]))
+
+        del levels, cur, left, right, e, gm, gp
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    g_minus = torch.cat(g_minus_all); g_plus = torch.cat(g_plus_all)
+    c = torch.cat(c_all); realized = torch.cat(realized_all)
+    pred_curv = torch.cat(pred_curv_all); count = torch.cat(count_all)
+    pred_geom = -(g_plus - g_minus) / 4.0
+    pred = pred_geom + pred_curv
+
+    return {
+        "g_minus": g_minus, "g_plus": g_plus, "c": c,
+        "realized": realized, "pred_geom": pred_geom,
+        "pred_curv": pred_curv, "pred": pred, "count": count,
+    }
