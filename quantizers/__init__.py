@@ -1,10 +1,11 @@
 """
-Non-uniform codebook quantizers (block-wise standard) + NCC correction.
+Non-uniform codebook quantizers (block-wise standard) + NCC / BC correction.
 
 Public API
 ----------
     get_quantizer(name, **kwargs) -> BaseQuantizer
     apply_ncc(W_fp, qres, mu, ...) -> (W_corrected, NCCStats)
+    apply_bias_correction(module, W_fp, W_q, mu, ...) -> BCStats
 
 Names: nf3, nf4, nvfp4, codebook3, codebook4.
 
@@ -16,6 +17,7 @@ Standard granularity (block = contiguous run along input sharing one scale):
 Contract:
     res = quantizer.quantize(W, row_chunk=1024)   # block-wise, OOM-safe
     W_corr, stats = apply_ncc(W_fp, res, mu, budget_p=..., row_chunk=1024)
+    bc_stats = apply_bias_correction(module, W_fp, res.W_dequant, mu, ...)
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from .normalfloat import NormalFloatQuantizer
 from .nvfp4 import NVFP4Quantizer
 from .learned_codebook import LearnedCodebookQuantizer
 from .ncc import apply_ncc, NCCStats, james_stein_mean
+from .bc import apply_bias_correction, compute_bias_correction, BCStats
 
 
 def _nf3(**kw):
@@ -70,5 +73,6 @@ __all__ = [
     "BaseQuantizer", "QuantResult",
     "NormalFloatQuantizer", "NVFP4Quantizer", "LearnedCodebookQuantizer",
     "apply_ncc", "NCCStats", "james_stein_mean",
+    "apply_bias_correction", "compute_bias_correction", "BCStats",
     "get_quantizer", "QUANTIZER_REGISTRY",
 ]

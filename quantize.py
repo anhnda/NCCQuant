@@ -3,14 +3,18 @@ Quantization driver.
 
 Loads a HuggingFace causal LM, builds a non-uniform codebook quantizer by name
 (nf3 / nf4 / nvfp4 / codebook3 / codebook4), and quantizes every nn.Linear layer.
-Optionally applies NCC first-moment correction, for which it collects the
-per-layer activation mean mu = E[x] (and variance sigma_ii = Var[x]) over a
-calibration set via forward hooks.
 
-Design mirrors the uploaded AWQ XL script: bfloat16 load, device_map="auto",
-batched calibration hooks, aggressive cleanup. The base group-wise uniform
-quantizer is replaced by the per-channel non-uniform codebook quantizer; the
-salience grid-search is replaced by NCC's first-moment correction.
+Two INDEPENDENT first-moment correctors are available (use either, neither, or
+compare):
+  --use-ncc  : NCC flips codewords under a budget so the per-channel first-moment
+               error mu . e shrinks (changes the dequantized WEIGHTS).
+  --bc       : naive bias correction folds the full mean output error
+               mu @ (W_fp - W_q)^T into the layer's BIAS, leaving the quantized
+               weights untouched. Standalone — it reads the plain quantized
+               weights, NOT any NCC-corrected version.
+
+Both read mu = E[x] (and, for NCC-Cov / James-Stein, the variance sigma_ii)
+collected over a calibration set via forward hooks.
 
 Global ASYM flag (quantizers.base_quantizer.ASYM) selects symmetric (absmax) vs
 asymmetric (affine min/max) per-block mapping; exposed here via --asym/--no-asym.
@@ -41,6 +45,7 @@ from tqdm import tqdm
 
 import quantizers.base_quantizer as base_q
 from quantizers import get_quantizer, apply_ncc
+from bc import apply_bias_correction
 
 
 # --------------------------------------------------------------------------- #
@@ -60,11 +65,11 @@ class ActMeanCollector:
     """Accumulates the running mean of the *input* activation for each Linear.
 
     For a Linear with weight [out, in], the input x has last-dim = in, which is
-    exactly the dimension NCC's mu lives on. We accumulate sum and count to form
-    mu = E[x] in a streaming, memory-light way (no stored activations).
-    Optionally also accumulates E[x^2] to give NCC a per-input-channel variance
-    estimate: sigma_ii = E[x^2] - E[x]^2 (used by score='cov' and, divided by the
-    token count m, by the James-Stein stabiliser).
+    exactly the dimension NCC's mu and BC's mu live on. We accumulate sum and
+    count to form mu = E[x] in a streaming, memory-light way (no stored
+    activations). Optionally also accumulates E[x^2] to give a per-input-channel
+    variance estimate sigma_ii = E[x^2] - E[x]^2 (used by NCC score='cov' and,
+    divided by the token count m, by the James-Stein stabiliser).
     """
 
     def __init__(self, want_var: bool = True):
@@ -137,6 +142,7 @@ def quantize_model(
     gap_floor: float = 1e-8,
     gap_floor_rel: float = 0.0,
     use_james_stein: bool = False,
+    use_bc: bool = False,
 ):
     # Gather target Linear layers.
     linears = [(n, m) for n, m in model.named_modules() if isinstance(m, nn.Linear)]
@@ -145,15 +151,15 @@ def quantize_model(
     print(f"Quantizing {len(linears)} Linear layers "
           f"({'skipping' if skip_lmhead else 'including'} lm_head)")
 
-    # Collect activation means (and variances) only if NCC is on.
+    # Collect activation means (and variances) if NCC or BC is on.
     means: Dict[str, torch.Tensor] = {}
     varis: Dict[str, torch.Tensor] = {}
     collector_counts: Dict[str, int] = {}
-    if use_ncc:
-        # cov rule and James-Stein both need second moments.
-        want_var = (ncc_score == "cov") or use_james_stein
-        print(f"Collecting activation means for NCC "
-              f"(want_var={want_var}, score={ncc_score}) ...")
+    if use_ncc or use_bc:
+        # cov rule and James-Stein need second moments; plain BC needs only mu.
+        want_var = (use_ncc and ncc_score == "cov") or use_james_stein
+        print(f"Collecting activation means "
+              f"(want_var={want_var}, ncc={use_ncc}, score={ncc_score}, bc={use_bc}) ...")
         collector = ActMeanCollector(want_var=want_var)
         collector.register(linears)
         for i, text in enumerate(calib_texts[:n_calib]):
@@ -179,11 +185,15 @@ def quantize_model(
     total_flips = 0
     bias_before_sum = 0.0
     bias_after_sum = 0.0
+    bc_layers = 0
+    bc_created = 0
+    bc_err_before_sum = 0.0
     for n, module in tqdm(linears, desc="Quantizing layers"):
         W = module.weight.data
         res = quantizer.quantize(W, row_chunk=row_chunk)
         W_out = res.W_dequant
 
+        # ---- NCC path: flip codewords (changes the dequantized weights). ----
         if use_ncc and n in means:
             mu = means[n].to(W.device)
             # Raw per-input-channel activation variance == sigma_ii (for cov rule).
@@ -211,7 +221,25 @@ def quantize_model(
             bias_before_sum += stats.bias_before
             bias_after_sum += stats.bias_after
 
+        # Write the quantized weights (NCC-corrected if NCC ran, else plain).
         module.weight.data = W_out.to(W.dtype)
+
+        # ---- BC path: STANDALONE naive bias correction. -------------------
+        # Reads the PLAIN quantized weights (res.W_dequant), NOT W_out, so it is
+        # independent of NCC: it folds the full mean output error of the plain
+        # quantized layer into the bias. (Run BC without NCC for pure bias
+        # correction; running both is a deliberate apples-to-oranges combo and
+        # generally not intended.)
+        if use_bc and n in means:
+            mu = means[n].to(W.device)
+            bc_stats = apply_bias_correction(
+                module=module, W_fp=W, W_q=res.W_dequant, mu=mu,
+                row_chunk=max(row_chunk, 4096),
+            )
+            bc_layers += 1
+            bc_created += int(bc_stats.bias_created)
+            bc_err_before_sum += bc_stats.out_err_before
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -221,10 +249,15 @@ def quantize_model(
         print(f"  NCC total flips: {total_flips}")
         print(f"  Calibration first-moment error: "
               f"{bias_before_sum:.6e} -> {bias_after_sum:.6e}")
+    if use_bc:
+        print(f"  BC applied to {bc_layers} layers "
+              f"({bc_created} new bias terms created)")
+        print(f"  BC absorbed output first-moment energy: "
+              f"{bc_err_before_sum:.6e} -> ~0")
 
 
 def main():
-    p = argparse.ArgumentParser(description="Non-uniform codebook quantization with NCC")
+    p = argparse.ArgumentParser(description="Non-uniform codebook quantization with NCC / BC")
     p.add_argument("--model-path", type=str, required=True, help="HF model name or local path")
     p.add_argument("--quantizer", type=str, default="nf4",
                    choices=["nf3", "nf4", "nvfp4", "codebook3", "codebook4"],
@@ -269,6 +302,12 @@ def main():
                    help="Apply James-Stein shrinkage to mu (ablation row; off by "
                         "default). Uses variance-of-the-mean = sigma_ii / m.")
 
+    # Standalone bias correction.
+    p.add_argument("--bc", dest="use_bc", action="store_true", default=False,
+                   help="Apply STANDALONE naive bias correction: fold the mean "
+                        "output error of the plain quantized weights into each "
+                        "Linear's bias (default: False). Independent of NCC.")
+
     # quantizer-specific knobs (block = standard non-uniform scaling granularity)
     p.add_argument("--nf-block-size", type=int, default=64, help="NF3/NF4 block size (bnb default 64)")
     p.add_argument("--nvfp4-block-size", type=int, default=16, help="NVFP4 micro-block size")
@@ -293,7 +332,8 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device} | Quantizer: {args.quantizer} | "
-          f"skip_lmhead={args.skip_lmhead} | ncc_score={args.ncc_score}")
+          f"skip_lmhead={args.skip_lmhead} | ncc={args.use_ncc} "
+          f"(score={args.ncc_score}) | bc={args.use_bc}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -327,6 +367,7 @@ def main():
         gap_floor=args.gap_floor,
         gap_floor_rel=args.gap_floor_rel,
         use_james_stein=args.use_james_stein,
+        use_bc=args.use_bc,
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
