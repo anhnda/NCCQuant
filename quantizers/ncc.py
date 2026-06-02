@@ -69,7 +69,7 @@ def apply_ncc(
     qres: QuantResult,
     mu: torch.Tensor,
     budget_p: float = 0.02,
-    use_james_stein: bool = True,
+    use_james_stein: bool = False,
     mu_var: Optional[torch.Tensor] = None,
     row_chunk: int = 1024,
 ) -> tuple[torch.Tensor, NCCStats]:

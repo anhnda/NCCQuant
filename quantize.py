@@ -170,7 +170,7 @@ def quantize_model(
                 mu_var = mu_var.to(W.device)
             W_out, stats = apply_ncc(
                 W_fp=W, qres=res, mu=mu,
-                budget_p=budget_p, use_james_stein=True, mu_var=mu_var,
+                budget_p=budget_p, use_james_stein=False, mu_var=mu_var,
                 row_chunk=row_chunk,
             )
             total_flips += stats.flips
