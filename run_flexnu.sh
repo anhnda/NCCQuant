@@ -198,9 +198,9 @@ PY
 # The ladder. E first so the baseline is on record before anything else runs.
 # --------------------------------------------------------------------------- #
 cell "E_codebook${BITS}"  "codebook${BITS}"
-cell "A_freeze_both"      "flexnu${BITS}"  --flexnu-freeze-codebook --flexnu-freeze-scale
-cell "B_codebook_only"    "flexnu${BITS}"  --flexnu-freeze-scale
-cell "C_divisor_only"     "flexnu${BITS}"  --flexnu-freeze-codebook
+#cell "A_freeze_both"      "flexnu${BITS}"  --flexnu-freeze-codebook --flexnu-freeze-scale
+#cell "B_codebook_only"    "flexnu${BITS}"  --flexnu-freeze-scale
+#cell "C_divisor_only"     "flexnu${BITS}"  --flexnu-freeze-codebook
 cell "D_joint"            "flexnu${BITS}"
 
 echo
