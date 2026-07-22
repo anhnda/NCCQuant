@@ -124,7 +124,7 @@ def main():
                    choices=["wikitext2", "c4"])
     p.add_argument("--max-length", type=int, default=2048, help="window size")
     p.add_argument("--stride", type=int, default=512)
-    p.add_argument("--n-samples", type=int, default=500,
+    p.add_argument("--n-samples", type=int, default=2000,
                    help="documents to use (c4); wikitext2 uses the full test set")
     p.add_argument("--out-json", type=str, default=None,
                    help="default: <model-path>/ppl.json")
