@@ -9,9 +9,14 @@ change it. Realised levels are stored in block_codebooks for NCC to read.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .base_quantizer import BaseQuantizer, QuantResult
+
+# Diagnostics are off unless CB_DEBUG=1, so normal runs are unaffected.
+_DEBUG = os.environ.get("CB_DEBUG", "") == "1"
 
 
 class LearnedCodebookQuantizer(BaseQuantizer):
@@ -64,8 +69,13 @@ class LearnedCodebookQuantizer(BaseQuantizer):
         zc = centers.abs().argmin(dim=1)
         centers[torch.arange(G, device=device), zc] = 0.0
         centers, _ = torch.sort(centers, dim=1)
+        if _DEBUG and not torch.isfinite(centers).all():
+            raise RuntimeError(
+                f"[codebook] non-finite centers from QUANTILE INIT: "
+                f"G={G} bw={bw} K={K} -- Wb finite={torch.isfinite(Wb).all().item()}"
+            )
 
-        for _ in range(self.n_iters):
+        for _it in range(self.n_iters):
             # centers is sorted, so nearest-center is a searchsorted against the
             # midpoints -- same assignment as the [G, bw, K] argmin, but O(log K)
             # and without the 268MB intermediate at full-row width.
@@ -81,6 +91,11 @@ class LearnedCodebookQuantizer(BaseQuantizer):
                 owns = mask.any(dim=1)
                 new_centers[:, k] = torch.where(owns, mean_k, centers[:, k])
             centers, _ = torch.sort(new_centers, dim=1)
+            if _DEBUG and not torch.isfinite(centers).all():
+                raise RuntimeError(
+                    f"[codebook] non-finite centers inside Lloyd iter={_it} "
+                    f"G={G} bw={bw} K={K}"
+                )
 
         # Strictly increasing (NCC neighbour reads require it).
         eps = 1e-7
@@ -112,6 +127,31 @@ class LearnedCodebookQuantizer(BaseQuantizer):
                 c1 = min(c0 + bs, in_features)
                 Wb = Wr[:, c0:c1]                              # [rc, bw]
                 centers = self._kmeans_blocks(Wb)             # [rc, K]
+
+                if _DEBUG:
+                    # Where does the nan come from? Three candidates, checked in
+                    # the order they could occur.
+                    if not torch.isfinite(centers).all():
+                        n_bad = (~torch.isfinite(centers)).sum().item()
+                        raise RuntimeError(
+                            f"[codebook] non-finite CENTERS: r0={r0} b={b} "
+                            f"count={n_bad} bw={c1 - c0}"
+                        )
+                    # Duplicate levels after the eps pass. Not fatal on its own,
+                    # but it means codewords are being wasted; if this fires at
+                    # full row and not at bw=64, the eps is the problem.
+                    dup = (centers[:, 1:] <= centers[:, :-1]).sum().item()
+                    # Same question one step later: duplicates that survive the
+                    # cast to the model dtype are unrecoverable.
+                    c16 = centers.to(W.dtype).float()
+                    dup16 = (c16[:, 1:] <= c16[:, :-1]).sum().item()
+                    if dup or dup16:
+                        print(
+                            f"[codebook] r0={r0} b={b} bw={c1 - c0} "
+                            f"dup_fp32={dup} dup_after_{W.dtype}={dup16}",
+                            flush=True,
+                        )
+
                 block_codebooks[r0:r1, b, :] = centers
                 block_scales[r0:r1, b] = Wb.abs().amax(dim=1)
 
@@ -121,8 +161,23 @@ class LearnedCodebookQuantizer(BaseQuantizer):
                 idx = torch.searchsorted(mid.contiguous(), Wb.contiguous())
                 idx = idx.clamp_(0, K - 1)
                 deq = torch.gather(centers, 1, idx)
+
+                if _DEBUG and not torch.isfinite(deq).all():
+                    raise RuntimeError(
+                        f"[codebook] non-finite DEQUANT: r0={r0} b={b} "
+                        f"(centers were finite, so this is gather/index)"
+                    )
+
                 W_dequant[r0:r1, c0:c1] = deq.to(W.dtype)
                 indices[r0:r1, c0:c1] = idx
+
+        if _DEBUG:
+            # Final gate: if this passes, the quantizer is clean and any nan in
+            # perplexity came from save/load/eval, not from here.
+            if not torch.isfinite(W_dequant).all():
+                raise RuntimeError("[codebook] non-finite W_dequant at exit")
+            rel = ((W_dequant.float() - W.float()).norm() / W.float().norm()).item()
+            print(f"[codebook] layer done: rel_err={rel:.4f} bs={bs}", flush=True)
 
         return QuantResult(
             W_dequant=W_dequant,
