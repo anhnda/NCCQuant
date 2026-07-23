@@ -1,3 +1,5 @@
+MODEL_PATH=/home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Llama-2-7b-hf/snapshots/01c7f73d771dfac7d292323805ebc428287df4f9 \
+bash run_flexnu.sh 
 python quantize.py --model-path ./models/Mistral-7B-v0.3 --quantizer nf4
 python quantize.py --model-path ./models/Mistral-7B-v0.3 --quantizer nvfp4 --budget-p 0.03
 python quantize.py --model-path ./models/Qwen2.5-7B --quantizer codebook3 --no-skip-lmhead
