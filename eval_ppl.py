@@ -21,7 +21,7 @@ side by side with numbers from a paper table. Always report ctx_len and stride.
 
 Usage:
     python eval_ppl.py --model-path ./quantized_models/flexnu/C_divisor_only \
-        --datasets wikitext2 c4-new --seqlen 2048
+        --datasets wikitext2 c4 --seqlen 2048
 
     python eval_ppl.py --model-path meta-llama/Llama-2-7b-hf \
         --datasets wikitext2 --seqlen 2048 --dtype fp16    # -> must print 5.47
@@ -76,7 +76,7 @@ def _load_corpus_ids(name: str, tokenizer, seqlen: int,
             f"bos={getattr(tokenizer, 'add_bos_token', None)}",
             f"eos={getattr(tokenizer, 'add_eos_token', None)}",
             f"vocab={len(tokenizer)}",
-            f"seqlen={seqlen}" if name == "c4-new" else "seqlen=na",
+            f"seqlen={seqlen}" if name == "c4" else "seqlen=na",
             f"tfm={_transformers_version()}",
         ])
         digest = hashlib.sha1(fingerprint.encode()).hexdigest()[:12]
@@ -92,9 +92,10 @@ def _load_corpus_ids(name: str, tokenizer, seqlen: int,
         # NO filtering: keep empty lines, exactly as in GPTQ datautils.py
         enc = tokenizer("\n\n".join(ds["text"]), return_tensors="pt").input_ids
 
-    elif name == "c4-new":
-        # GPTQ get_c4_new. NOT the same as GPTQ's older get_c4, which samples
-        # 256 separate seqlen-long excerpts at random. Report the variant.
+    elif name == "c4":
+        # GPTQ get_c4_new (the --new-eval path, which is what later papers
+        # follow). NOT the older get_c4, which samples 256 separate
+        # seqlen-long excerpts at random.
         # revision pinned so every run sees the same text.
         ds = load_dataset(
             "allenai/c4",
@@ -255,9 +256,10 @@ def main():
     p = argparse.ArgumentParser(description="Perplexity evaluation (GPTQ protocol)")
     p.add_argument("--model-path", type=str, required=True)
     p.add_argument("--datasets", type=str, nargs="+", default=["wikitext2"],
-                   choices=["wikitext2", "c4-new", "ptb-new"],
-                   help="c4-new / ptb-new are the GPTQ get_c4_new / get_ptb_new "
-                        "variants. Report the variant name, not bare 'c4'/'ptb'.")
+                   choices=["wikitext2", "c4", "ptb-new"],
+                   help="c4 uses GPTQ's get_c4_new loader; ptb-new uses "
+                        "get_ptb_new (test split), which differs from the "
+                        "older get_ptb.")
     p.add_argument("--seqlen", type=int, default=2048,
                    help="2048 for Llama-1/2; 8192 for Llama-3/Qwen3. "
                         "Numbers at different seqlen are NOT comparable.")
