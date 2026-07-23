@@ -17,9 +17,14 @@ from .base_quantizer import BaseQuantizer, QuantResult
 class LearnedCodebookQuantizer(BaseQuantizer):
     """Per-(row, block) learned scalar codebook via 1-D k-means."""
 
-    def __init__(self, bits: int, block_size: int = 64, n_iters: int = 20, seed: int = 0):
+    def __init__(self, bits: int, block_size: int | None = 64,
+                 n_iters: int = 20, seed: int = 0):
         if bits not in (3, 4):
             raise ValueError(f"LearnedCodebook supports bits in {{3,4}}, got {bits}")
+        # Full row is signalled by block_size <= 0 in the base class; accept
+        # None as a synonym so either caller convention works.
+        if block_size is None:
+            block_size = -1
         super().__init__(bits=bits, block_size=block_size)
         self.name = f"codebook{bits}"
         self.num_levels = 2 ** bits
@@ -90,7 +95,7 @@ class LearnedCodebookQuantizer(BaseQuantizer):
         device = W.device
         out_features, in_features = W.shape
         K = self.num_levels
-        bs = self.block_size
+        bs = self._resolve_block_size(in_features)
         n_blocks = (in_features + bs - 1) // bs
 
         W_dequant = torch.empty_like(W)
