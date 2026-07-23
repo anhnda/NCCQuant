@@ -23,9 +23,12 @@ class LearnedCodebookQuantizer(BaseQuantizer):
     """Per-(row, block) learned scalar codebook via 1-D k-means."""
 
     def __init__(self, bits: int, block_size: int | None = 64,
-                 n_iters: int = 20, seed: int = 0):
+                 n_iters: int = 50, seed: int = 0, init: str = "kmeans++"):
         if bits not in (3, 4):
             raise ValueError(f"LearnedCodebook supports bits in {{3,4}}, got {bits}")
+        if init not in ("kmeans++", "quantile"):
+            raise ValueError(
+                f"init must be 'kmeans++' or 'quantile'; got {init!r}")
         # Full row is signalled by block_size <= 0 in the base class; accept
         # None as a synonym so either caller convention works.
         if block_size is None:
@@ -35,12 +38,120 @@ class LearnedCodebookQuantizer(BaseQuantizer):
         self.num_levels = 2 ** bits
         self.n_iters = n_iters
         self.seed = seed
+        # 'kmeans++' : greedy D2 sampling, as SqueezeLLM does it (via
+        #              flash1dkmeans._kmeans_plusplus). Honours sample_weight.
+        # 'quantile' : equal-mass cuts off the sorted row. Cheaper, and what the
+        #              pre-existing block_size=64 path used.
+        self.init = init
 
     @property
     def q_levels(self) -> torch.Tensor:
         # No canonical shape for a learned codebook; expose a placeholder grid so
         # callers that only need L work. Realised levels live in block_codebooks.
         return torch.linspace(-1.0, 1.0, self.num_levels)
+
+    @torch.no_grad()
+    def _kmeanspp_init(self, sorted_X: torch.Tensor,
+                       sw_sorted: torch.Tensor | None, K: int) -> torch.Tensor:
+        """Greedy k-means++ seeding, batched over rows. [G, bw] -> [G, K].
+
+        Port of flash1dkmeans._kmeans_plusplus (the routine SqueezeLLM seeds
+        with). The numba original runs one row at a time; here all G rows draw
+        simultaneously, so each step is a single batched kernel.
+
+        Weighted when sw_sorted is given: the first draw is proportional to
+        weight, and later draws to  s_x * d(x)^2  -- so importance shapes the
+        seed, not just the Lloyd refinement that follows.
+
+        Inertia is read from prefix sums rather than recomputed, which is what
+        makes scoring 2+log(K) candidates per step affordable:
+            sum(s*(x-c)^2) = S2 - 2c*S1 + c^2*S0
+        with S0/S1/S2 the running sums of s, s*x, s*x^2.
+        """
+        G, bw = sorted_X.shape
+        device = sorted_X.device
+        Xd = sorted_X.double()
+        if sw_sorted is None:
+            w = torch.ones(G, bw, device=device, dtype=torch.float64)
+        else:
+            w = sw_sorted.double()
+
+        def _pfx(t):
+            p = torch.zeros(G, bw + 1, device=device, dtype=torch.float64)
+            p[:, 1:] = torch.cumsum(t, dim=1)
+            return p
+
+        S0, S1, S2 = _pfx(w), _pfx(w * Xd), _pfx(w * Xd * Xd)
+
+        def _borders(sc):
+            """Rank of each midpoint. [G,k] -> [G,k+1]. k comes from the input."""
+            k = sc.shape[1]
+            b = torch.empty(G, k + 1, device=device, dtype=torch.long)
+            b[:, 0] = 0
+            b[:, -1] = bw
+            if k > 1:
+                mid = 0.5 * (sc[:, 1:] + sc[:, :-1])
+                b[:, 1:-1] = torch.searchsorted(
+                    sorted_X.contiguous(), mid.contiguous())
+            return b.clamp_(0, bw)
+
+        def _total_inertia(sc):
+            b = _borders(sc)
+            lo, hi = b[:, :-1], b[:, 1:]
+            s0 = torch.gather(S0, 1, hi) - torch.gather(S0, 1, lo)
+            s1 = torch.gather(S1, 1, hi) - torch.gather(S1, 1, lo)
+            s2 = torch.gather(S2, 1, hi) - torch.gather(S2, 1, lo)
+            c = sc.double()
+            return (s2 - 2.0 * c * s1 + c * c * s0).clamp_(min=0.0).sum(dim=1)
+
+        def _closest_d2(sc):
+            """Squared distance to the nearest chosen center. [G, bw]."""
+            k = sc.shape[1]
+            if k == 1:
+                return (sorted_X - sc[:, :1]) ** 2
+            b = _borders(sc)
+            cuts = b[:, 1:-1].contiguous()                          # [G, k-1]
+            pos = torch.arange(bw, device=device).view(1, -1).expand(G, bw)
+            owner_idx = torch.searchsorted(cuts, pos.contiguous(), right=True)
+            owner = torch.gather(sc, 1, owner_idx.clamp(max=k - 1))
+            return (sorted_X - owner) ** 2
+
+        gen = torch.Generator(device=device if device.type != "mps" else "cpu")
+        gen.manual_seed(self.seed)
+
+        def _rand(*shape):
+            return torch.rand(*shape, device=device, generator=gen, dtype=torch.float64)
+
+        centers = torch.empty(G, K, device=device, dtype=sorted_X.dtype)
+        # First center: drawn proportional to weight (uniform when unweighted).
+        cw0 = torch.cumsum(w, dim=1)
+        first = torch.searchsorted(
+            cw0.contiguous(), (_rand(G, 1) * cw0[:, -1:].clamp(min=1e-30)).contiguous())
+        centers[:, :1] = torch.gather(sorted_X, 1, first.clamp_(0, bw - 1))
+
+        n_trials = 2 + int(torch.log(torch.tensor(float(K))).item())
+
+        for c_id in range(1, K):
+            d2 = _closest_d2(centers[:, :c_id]).double() * w        # weighted D2
+            cw = torch.cumsum(d2, dim=1)
+            total = cw[:, -1:].clamp(min=1e-30)
+            sel = _rand(G, n_trials) * total
+            cand_idx = torch.searchsorted(cw.contiguous(), sel.contiguous())
+            cand = torch.gather(sorted_X, 1, cand_idx.clamp_(0, bw - 1))  # [G, L]
+
+            best_e = torch.full((G,), float("inf"), device=device, dtype=torch.float64)
+            best_c = cand[:, 0].clone()
+            for t in range(n_trials):
+                trial, _ = torch.sort(
+                    torch.cat([centers[:, :c_id], cand[:, t:t + 1]], dim=1), dim=1)
+                e = _total_inertia(trial)
+                better = e < best_e
+                best_e = torch.where(better, e, best_e)
+                best_c = torch.where(better, cand[:, t], best_c)
+            centers[:, c_id] = best_c
+
+        centers, _ = torch.sort(centers, dim=1)
+        return centers
 
     @torch.no_grad()
     def _kmeans_blocks(self, Wb: torch.Tensor,
@@ -66,6 +177,18 @@ class LearnedCodebookQuantizer(BaseQuantizer):
             if sw.shape[0] == 1 and G > 1:
                 sw = sw.expand(G, bw)
             sw = sw.clamp(min=0)
+            # GuidedQuant masks the sample weight wherever the weight itself is
+            # exactly zero (weight_mask = weights_np != 0): a pruned/absent
+            # weight has no reconstruction error to pay for, so it must not
+            # attract a level.
+            sw = sw * (Wb != 0).to(sw.dtype)
+            # If a row's weights sum to zero the weighted objective is degenerate
+            # -- GuidedQuant falls back to uniform weights for that row rather
+            # than dividing by ~0. Same here, per row.
+            row_total = sw.sum(dim=1, keepdim=True)
+            degenerate = row_total <= 0
+            if bool(degenerate.any()):
+                sw = torch.where(degenerate, torch.ones_like(sw), sw)
 
         # torch.quantile refuses inputs past ~16M elements in the reduced dim
         # (it sorts internally and the impl caps it). Sort once ourselves and
@@ -73,68 +196,97 @@ class LearnedCodebookQuantizer(BaseQuantizer):
         # torch.quantile(..., interpolation='linear'), no cap. The sorted copy
         # is reused by the Lloyd assignment below.
         sorted_X, sort_idx = torch.sort(Wb, dim=1)                 # [G, bw]
-        qs = torch.linspace(0.0, 1.0, K, device=device, dtype=torch.float32)
-
-        if sw is None:
-            # Unweighted: quantile position is a plain fractional rank.
-            pos = qs * (bw - 1)                                    # [K]
-            lo_i = pos.floor().long().clamp(0, bw - 1)
-            hi_i = pos.ceil().long().clamp(0, bw - 1)
-            frac = (pos - lo_i.to(pos.dtype)).to(sorted_X.dtype)   # [K]
-            centers = sorted_X[:, lo_i] + (sorted_X[:, hi_i] - sorted_X[:, lo_i]) * frac
-            centers = centers.contiguous()                         # [G, K]
-        else:
-            # Weighted: cut at equal WEIGHT MASS rather than equal count, so the
-            # seed already reflects importance. Per-row, since the weight mass
-            # differs by row once sw is expanded.
+        sw_sorted = None
+        if sw is not None:
             sw_sorted = torch.gather(sw, 1, sort_idx)              # [G, bw]
-            cw = torch.cumsum(sw_sorted.double(), dim=1)           # [G, bw]
-            total = cw[:, -1:].clamp(min=1e-30)
-            targets = qs.double().view(1, -1) * total              # [G, K]
-            idx = torch.searchsorted(cw.contiguous(), targets.contiguous())
-            idx = idx.clamp_(0, bw - 1)
-            centers = torch.gather(sorted_X, 1, idx).contiguous()  # [G, K]
 
-        zc = centers.abs().argmin(dim=1)
-        centers[torch.arange(G, device=device), zc] = 0.0
+        if self.init == "kmeans++":
+            centers = self._kmeanspp_init(sorted_X, sw_sorted, K)
+        else:
+            qs = torch.linspace(0.0, 1.0, K, device=device, dtype=torch.float32)
+            if sw is None:
+                # Unweighted: quantile position is a plain fractional rank.
+                pos = qs * (bw - 1)                                    # [K]
+                lo_i = pos.floor().long().clamp(0, bw - 1)
+                hi_i = pos.ceil().long().clamp(0, bw - 1)
+                frac = (pos - lo_i.to(pos.dtype)).to(sorted_X.dtype)   # [K]
+                centers = sorted_X[:, lo_i] + (sorted_X[:, hi_i] - sorted_X[:, lo_i]) * frac
+                centers = centers.contiguous()                         # [G, K]
+            else:
+                # Weighted: cut at equal WEIGHT MASS rather than equal count, so
+                # the seed already reflects importance.
+                cw = torch.cumsum(sw_sorted.double(), dim=1)           # [G, bw]
+                total = cw[:, -1:].clamp(min=1e-30)
+                targets = qs.double().view(1, -1) * total              # [G, K]
+                idx = torch.searchsorted(cw.contiguous(), targets.contiguous())
+                idx = idx.clamp_(0, bw - 1)
+                centers = torch.gather(sorted_X, 1, idx).contiguous()  # [G, K]
+
         centers, _ = torch.sort(centers, dim=1)
         if _DEBUG and not torch.isfinite(centers).all():
             raise RuntimeError(
-                f"[codebook] non-finite centers from QUANTILE INIT: "
+                f"[codebook] non-finite centers from {self.init} INIT: "
                 f"G={G} bw={bw} K={K} -- Wb finite={torch.isfinite(Wb).all().item()}"
             )
 
+        # ---- Lloyd, ported from flash1dkmeans.numba_kmeans_1d_k_cluster -----
+        # Their loop works on borders into sorted_X, not on assignments over the
+        # raw row: centroid k is a prefix-sum query over [border_k, border_k+1),
+        # which is O(1) instead of a masked reduction over [G, bw]. Iteration
+        # stops when the borders stop moving.
+        Xd = sorted_X.double()
+        if sw_sorted is None:
+            wd = torch.ones(G, bw, device=device, dtype=torch.float64)
+        else:
+            wd = sw_sorted.double()
+
+        def _pfx(t):
+            p = torch.zeros(G, bw + 1, device=device, dtype=torch.float64)
+            p[:, 1:] = torch.cumsum(t, dim=1)
+            return p
+
+        W0 = _pfx(wd)                 # weights_prefix_sum
+        W1 = _pfx(wd * Xd)            # weighted_X_prefix_sum
+        C1 = _pfx(Xd)                 # plain sums, for the zero-weight branch
+
+        borders = torch.full((G, K + 1), -1, device=device, dtype=torch.long)
+        borders[:, 0] = 0
+        borders[:, -1] = bw
+
         for _it in range(self.n_iters):
-            # centers is sorted, so nearest-center is a searchsorted against the
-            # midpoints -- same assignment as the [G, bw, K] argmin, but O(log K)
-            # and without the 268MB intermediate at full-row width.
-            mid = 0.5 * (centers[:, 1:] + centers[:, :-1])         # [G, K-1]
-            assign = torch.searchsorted(mid.contiguous(), Wb.contiguous())
-            assign = assign.clamp_(0, K - 1)                       # [G, bw]
-            new_centers = centers.clone()
-            for k in range(K):
-                mask = (assign == k)
-                if sw is None:
-                    denom = mask.sum(dim=1).clamp(min=1).to(Wb.dtype)
-                    summ = (Wb * mask).sum(dim=1)
-                else:
-                    # SqueezeLLM objective: centroid is the WEIGHTED mean.
-                    m = mask.to(Wb.dtype) * sw
-                    denom = m.sum(dim=1)
-                    summ = (Wb * m).sum(dim=1)
-                    # A cluster whose total weight is zero contributes nothing to
-                    # the objective; fall back to the unweighted mean so the level
-                    # still lands on its own data instead of dividing by zero.
-                    zero_w = denom <= 0
-                    if bool(zero_w.any()):
-                        cnt = mask.sum(dim=1).clamp(min=1).to(Wb.dtype)
-                        summ = torch.where(zero_w, (Wb * mask).sum(dim=1), summ)
-                        denom = torch.where(zero_w, cnt, denom)
-                    denom = denom.clamp(min=1e-30)
-                mean_k = summ / denom
-                owns = mask.any(dim=1)
-                new_centers[:, k] = torch.where(owns, mean_k, centers[:, k])
-            centers, _ = torch.sort(new_centers, dim=1)
+            # _centroids_to_cluster_borders: cut at the midpoints.
+            new_borders = borders.clone()
+            if K > 1:
+                mid = 0.5 * (centers[:, 1:] + centers[:, :-1])
+                new_borders[:, 1:-1] = torch.searchsorted(
+                    sorted_X.contiguous(), mid.contiguous())
+            new_borders.clamp_(0, bw)
+            # Guard not present in the reference: their centroids stay sorted by
+            # construction, ours come back from a masked where() that can leave
+            # an empty cluster's stale level out of order. cummax keeps the
+            # borders monotone so the prefix-sum queries stay well-formed.
+            new_borders, _ = torch.cummax(new_borders, dim=1)
+            new_borders[:, 0] = 0
+            new_borders[:, -1] = bw
+
+            if torch.equal(new_borders, borders):
+                break
+            borders = new_borders
+
+            lo, hi = borders[:, :-1], borders[:, 1:]
+            wsum = torch.gather(W0, 1, hi) - torch.gather(W0, 1, lo)
+            wxsum = torch.gather(W1, 1, hi) - torch.gather(W1, 1, lo)
+            # cluster_weight_sum == 0 -> plain mean of the cluster (their branch)
+            cnt = (hi - lo).double()
+            xsum = torch.gather(C1, 1, hi) - torch.gather(C1, 1, lo)
+            zero_w = wsum <= 0
+            num = torch.where(zero_w, xsum, wxsum)
+            den = torch.where(zero_w, cnt, wsum).clamp(min=1e-30)
+            mean = (num / den).to(centers.dtype)
+            # cluster_start == cluster_end -> `continue`, i.e. keep the old level
+            empty = (hi - lo) <= 0
+            centers = torch.where(empty, centers, mean)
+
             if _DEBUG and not torch.isfinite(centers).all():
                 raise RuntimeError(
                     f"[codebook] non-finite centers inside Lloyd iter={_it} "

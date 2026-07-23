@@ -300,11 +300,12 @@ class FlexNuQuantizer(BaseQuantizer):
                  eval_every: int = 1,
                  init: str = "lloyd",
                  init_levels: Optional[torch.Tensor] = None,
-                 init_iters: int = 20,
+                 init_iters: int = 50,
                  row_block: int = 128,
                  lambda_s2: float = 0.0,
                  work_dtype: torch.dtype = torch.float32,
                  seed: int = 0,
+                 kmeans_init: str = "kmeans++",
                  verbose: bool = False):
         if bits not in (2, 3, 4):
             raise ValueError(f"FlexNu supports bits in {{2,3,4}}, got {bits}")
@@ -327,6 +328,12 @@ class FlexNuQuantizer(BaseQuantizer):
         self.init = init
         self.init_levels = init_levels
         self.init_iters = int(init_iters)
+        # Seeding for the 'lloyd' path: 'kmeans++' matches SqueezeLLM (weighted
+        # D2 sampling), 'quantile' is the cheaper equal-mass seed.
+        if kmeans_init not in ("kmeans++", "quantile"):
+            raise ValueError(
+                f"kmeans_init must be 'kmeans++' or 'quantile'; got {kmeans_init!r}")
+        self.kmeans_init = kmeans_init
         self.row_block = int(row_block)
         self.lambda_s2 = float(lambda_s2)
         self.work_dtype = work_dtype
@@ -400,12 +407,18 @@ class FlexNuQuantizer(BaseQuantizer):
                        G: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Initial sorted codebook per block. Wb: [R, n_blocks, bw] -> [R, n_blocks, K].
 
-        When G is given, the k-means init is WEIGHTED by diag(G) = E[x_j^2],
-        the SqueezeLLM sensitivity signal: a weight on a high-energy input
-        channel moves the output more, so it deserves a closer level. The
-        FlexNu objective is Tr(R G R^T), and diag(G) is exactly its diagonal
-        part -- so this seeds the optimiser with a codebook already aligned to
-        the objective it is about to minimise, instead of a plain-MSE one.
+        When G is given, the k-means init is WEIGHTED by diag(G) = E[x_j^2].
+        This occupies the same slot as SqueezeLLM does in GuidedQuant's
+        pipeline: a scalar per-element weight feeding 1-D k-means, whose output
+        then seeds the optimiser (LNQ there, FlexNu here).
+
+        Two honest caveats. GuidedQuant's scalar weight is the squared END-LOSS
+        gradient, per weight [out, in]; diag(G) is layer-local and per input
+        channel only, so it is the same shape of signal from a weaker source
+        and cannot distinguish output rows. And FlexNu minimises the full
+        Tr(R G R^T) including off-diagonals, so this seed is aligned with the
+        DIAGONAL of that objective, not the objective itself -- at full row
+        the diagonal is 4096 of ~16.7M entries.
         """
         R, nb, bw = Wb.shape
         K = self.num_levels
@@ -417,6 +430,7 @@ class FlexNuQuantizer(BaseQuantizer):
                 block_size=self.block_size,
                 n_iters=self.init_iters,
                 seed=self.seed,
+                init=self.kmeans_init,
             )
             helper.num_levels = K          # support bits=2 through the same routine
 
