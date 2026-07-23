@@ -96,13 +96,17 @@ class LNQQuantizer(BaseQuantizer):
 
     # ------------------------------------------------------------------ #
     def _prepare_H(self, G: torch.Tensor, pin: int, device, dtype):
-        """Dampen and normalise the Hessian. [in,in] -> [in,in] unit diagonal.
+        """Dampen the Gram, and return (H, Hn).
 
-        update_P divides H by its own diagonal (reference lines 87-89) so the
-        per-column solve has coefficient 1. Doing it once here saves repeating
-        it every cycle. Damping keeps the Cholesky in update_C from failing on
-        a rank-deficient Gram, which is common when calibration samples are
-        fewer than in_features.
+        H  : damped Gram, still SYMMETRIC and PSD. This is what update_C
+             Choleskys -- the reference factorises the raw H (layerwise_quantize
+             line 145), before any normalisation.
+        Hn : H with each row divided by its own diagonal, H_ij / H_ii. update_P
+             needs this so the per-column solve has unit coefficient (reference
+             lines 87-89). It is NOT symmetric, so it must never be handed to
+             Cholesky -- doing that was a bug: symmetrising a row-normalised
+             matrix gives something that is neither the Gram nor PSD, and no
+             amount of jitter rescues it.
         """
         H = G.to(device=device, dtype=dtype)
         if H.shape[0] < pin:
@@ -113,12 +117,16 @@ class LNQQuantizer(BaseQuantizer):
         elif H.shape[0] > pin:
             H = H[:pin, :pin]
 
+        # Symmetrise first: the collected Gram can be very slightly asymmetric
+        # from accumulation order, which is enough to fail Cholesky.
+        H = 0.5 * (H + H.transpose(0, 1))
         d = torch.diagonal(H)
         mean_d = d.mean().clamp(min=1e-12)
         H = H + torch.eye(pin, device=device, dtype=dtype) * (self.damp * mean_d)
+
         d = torch.diagonal(H).clamp(min=1e-12)
-        # Row-normalise by the diagonal: H_ij / H_ii.
-        return H / d.view(-1, 1)
+        Hn = H / d.view(-1, 1)
+        return H, Hn
 
     # ------------------------------------------------------------------ #
     @torch.no_grad()
@@ -220,20 +228,27 @@ class LNQQuantizer(BaseQuantizer):
         n_blocks = 1
 
         Wf = W.to(dtype)
-        Hn = self._prepare_H(self._G, in_features, device, dtype)
+        H, Hn = self._prepare_H(self._G, in_features, device, dtype)
 
-        # Cholesky of the (symmetrised, damped) Hessian for update_C.
-        Hs = 0.5 * (Hn + Hn.transpose(0, 1))
+        # Cholesky of the SYMMETRIC damped Gram (not Hn -- see _prepare_H).
+        eye = torch.eye(in_features, device=device, dtype=dtype)
+        base = torch.diagonal(H).mean().clamp(min=1e-12)
+        L = None
         jitter = 0.0
-        for _ in range(6):
+        for _ in range(8):
             try:
-                L = torch.linalg.cholesky(
-                    Hs + torch.eye(in_features, device=device, dtype=dtype) * jitter)
+                L = torch.linalg.cholesky(H + eye * jitter)
                 break
             except Exception:
-                jitter = max(jitter * 10, 1e-6)
-        else:
-            raise RuntimeError("LNQ: Cholesky failed even after jittering the Gram")
+                jitter = base * 1e-6 if jitter == 0.0 else jitter * 10.0
+        if L is None:
+            raise RuntimeError(
+                f"LNQ: Cholesky failed after jittering to {jitter:.3e} "
+                f"(mean diag {float(base):.3e}). The Gram is badly rank "
+                f"deficient -- raise --lnq-damp or use more calibration samples."
+            )
+        if _DEBUG and jitter > 0:
+            print(f"[lnq] Cholesky needed jitter={jitter:.3e}", flush=True)
         Lt = L.transpose(0, 1).contiguous()
 
         # ---- init: SqueezeLLM-style weighted k-means (codebook AND labels) --
@@ -264,16 +279,16 @@ class LNQQuantizer(BaseQuantizer):
                 mid.contiguous(), Wb.contiguous()).clamp_(0, K - 1)
 
         if self.verbose:
-            e0 = self._objective(Wf, Hn, C, labels)
+            e0 = self._objective(Wf, H, C, labels)
             print(f"[lnq] init objective = {e0:.6e}", flush=True)
 
         # ---- alternate ------------------------------------------------------
-        best_e = self._objective(Wf, Hn, C, labels)
+        best_e = self._objective(Wf, H, C, labels)
         best_C, best_lab = C.clone(), labels.clone()
         for it in range(self.iters):
             labels = self._update_P(Wf, Hn, C, labels)
             C = self._update_C(Wf, Lt, labels, K)
-            e = self._objective(Wf, Hn, C, labels)
+            e = self._objective(Wf, H, C, labels)
             if self.verbose:
                 print(f"[lnq] iter {it:02d}  objective = {e:.6e}", flush=True)
             if e < best_e:
