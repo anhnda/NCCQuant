@@ -9,6 +9,14 @@ change it. Realised levels are stored in block_codebooks for NCC to read.
 Default granularity is FULL ROW: block_size=None (or <=0) means one block per
 output row spanning every input channel, i.e. one learned codebook per row.
 Pass an explicit positive block_size to get the classic block-wise behaviour.
+
+Seeding is selectable via init=:
+  'quantile' (default) — equal-VALUE cuts read off the already-sorted row. Same
+      placement as torch.quantile with linear interpolation, but without its
+      ~16M-element ceiling, since no second sort is needed.
+  'rank'     — equal-COUNT cuts. Cannot produce an empty cluster.
+  'kmeans++' — D2 sampling, ported from flash1dkmeans (unweighted variant).
+Lloyd refinement runs after all three.
 """
 
 from __future__ import annotations
@@ -22,7 +30,7 @@ class LearnedCodebookQuantizer(BaseQuantizer):
     """Per-(row, block) learned scalar codebook via 1-D k-means."""
 
     def __init__(self, bits: int, block_size: int | None = None,
-                 n_iters: int = 20, seed: int = 0, init: str = "kmeans++"):
+                 n_iters: int = 20, seed: int = 0, init: str = "quantile"):
         if bits not in (3, 4):
             raise ValueError(f"LearnedCodebook supports bits in {{3,4}}, got {bits}")
         if init not in ("kmeans++", "quantile", "rank"):
