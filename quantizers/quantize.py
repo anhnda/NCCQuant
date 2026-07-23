@@ -44,7 +44,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import quantizers.base_quantizer as base_q
-from quantizers import get_quantizer, apply_ncc, NEEDS_GRAM
+from quantizers import get_quantizer, apply_ncc, NEEDS_GRAM, QUANTIZER_REGISTRY
 from quantizers.gram_collect import GramCollector
 from quantizers import apply_bias_correction
 
@@ -338,11 +338,11 @@ def main():
     p = argparse.ArgumentParser(description="Non-uniform codebook quantization with NCC / BC")
     p.add_argument("--model-path", type=str, required=True, help="HF model name or local path")
     p.add_argument("--quantizer", type=str, default="nf4",
-                   choices=["nf3", "nf4", "nvfp4", "codebook3", "codebook4",
-                            "flexnu2", "flexnu3", "flexnu4"],
+                   choices=sorted(QUANTIZER_REGISTRY),
                    help="Non-uniform codebook to use. flexnu* = FlexRound-style "
-                        "learnable rounding with a jointly learned sorted codebook "
-                        "(needs the full activation Gram).")
+                        "learnable rounding with a jointly learned sorted codebook. "
+                        "lnq* = coordinate descent against the full Gram. Both "
+                        "need the activation Gram.")
     p.add_argument("--output-dir", type=str, default="./quantized_model")
     p.add_argument("--skip-lmhead", dest="skip_lmhead", action="store_true", default=True,
                    help="Skip quantizing lm_head (default: True)")
