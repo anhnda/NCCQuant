@@ -21,7 +21,7 @@ side by side with numbers from a paper table. Always report ctx_len and stride.
 
 Usage:
     python eval_ppl.py --model-path ./quantized_models/flexnu/C_divisor_only \
-        --datasets wikitext2 c4 --seqlen 2048
+        --datasets wikitext2 c4-new --seqlen 2048
 
     python eval_ppl.py --model-path meta-llama/Llama-2-7b-hf \
         --datasets wikitext2 --seqlen 2048 --dtype fp16    # -> must print 5.47
@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import pickle
@@ -39,6 +40,14 @@ from typing import Dict, List, Optional
 
 import torch
 from tqdm import tqdm
+
+
+def _transformers_version() -> str:
+    try:
+        import transformers
+        return transformers.__version__
+    except Exception:
+        return "unknown"
 
 
 # --------------------------------------------------------------------------- #
@@ -55,10 +64,23 @@ def _load_corpus_ids(name: str, tokenizer, seqlen: int,
     cache_file = None
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        tok_id = getattr(tokenizer, "name_or_path", "tok").replace("/", "_")
-        # Only c4 depends on seqlen (truncated to 256*seqlen); wikitext2/ptb do not.
-        suffix = f"_{seqlen}" if name == "c4" else ""
-        cache_file = cache_dir / f"{name}_{tok_id}{suffix}.pkl"
+        # The cache key must capture everything that can change the token stream.
+        # Keying on the model name alone is a silent-corruption trap: flip
+        # use_fast or add_bos_token, rerun, and you would read back a stale
+        # tokenization and report wrong numbers with no warning.
+        fingerprint = "|".join([
+            name,
+            str(getattr(tokenizer, "name_or_path", "tok")),
+            type(tokenizer).__name__,
+            f"fast={bool(getattr(tokenizer, 'is_fast', False))}",
+            f"bos={getattr(tokenizer, 'add_bos_token', None)}",
+            f"eos={getattr(tokenizer, 'add_eos_token', None)}",
+            f"vocab={len(tokenizer)}",
+            f"seqlen={seqlen}" if name == "c4-new" else "seqlen=na",
+            f"tfm={_transformers_version()}",
+        ])
+        digest = hashlib.sha1(fingerprint.encode()).hexdigest()[:12]
+        cache_file = cache_dir / f"{name}_{digest}.pkl"
         if cache_file.exists():
             with open(cache_file, "rb") as fh:
                 return pickle.load(fh)
@@ -70,8 +92,10 @@ def _load_corpus_ids(name: str, tokenizer, seqlen: int,
         # NO filtering: keep empty lines, exactly as in GPTQ datautils.py
         enc = tokenizer("\n\n".join(ds["text"]), return_tensors="pt").input_ids
 
-    elif name == "c4":
-        # get_c4_new: revision pinned so every run sees the same text
+    elif name == "c4-new":
+        # GPTQ get_c4_new. NOT the same as GPTQ's older get_c4, which samples
+        # 256 separate seqlen-long excerpts at random. Report the variant.
+        # revision pinned so every run sees the same text.
         ds = load_dataset(
             "allenai/c4",
             "default",
@@ -82,7 +106,9 @@ def _load_corpus_ids(name: str, tokenizer, seqlen: int,
         enc = tokenizer(" ".join(ds[:1100]["text"]), return_tensors="pt").input_ids
         enc = enc[:, : 256 * seqlen]
 
-    elif name == "ptb":
+    elif name == "ptb-new":
+        # GPTQ get_ptb_new: test split, " ".join. The older get_ptb uses the
+        # validation split and "\n\n".join and gives different numbers.
         ds = load_dataset("ptb_text_only", "penn_treebank", split="test")
         enc = tokenizer(" ".join(ds["sentence"]), return_tensors="pt").input_ids
 
@@ -104,6 +130,10 @@ def eval_ppl(model, tokenizer, testcases: List[str], seqlen: int = 2048,
     model.eval()
     device = next(model.parameters()).device
     results: Dict[str, float] = {}
+
+    # KV cache is useless for teacher-forced scoring and wastes VRAM.
+    prev_use_cache = getattr(model.config, "use_cache", None)
+    model.config.use_cache = False
 
     for name in testcases:
         enc = _load_corpus_ids(name, tokenizer, seqlen, cache_dir)
@@ -134,6 +164,8 @@ def eval_ppl(model, tokenizer, testcases: List[str], seqlen: int = 2048,
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    if prev_use_cache is not None:
+        model.config.use_cache = prev_use_cache
     return results
 
 
@@ -147,6 +179,9 @@ def eval_ppl_sliding(model, tokenizer, testcases: List[str], ctx_len: int = 2048
     model.eval()
     device = next(model.parameters()).device
     results: Dict[str, float] = {}
+
+    prev_use_cache = getattr(model.config, "use_cache", None)
+    model.config.use_cache = False
 
     for name in testcases:
         enc = _load_corpus_ids(name, tokenizer, ctx_len, cache_dir).to(device)
@@ -205,6 +240,8 @@ def eval_ppl_sliding(model, tokenizer, testcases: List[str], ctx_len: int = 2048
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    if prev_use_cache is not None:
+        model.config.use_cache = prev_use_cache
     return results
 
 
@@ -218,7 +255,9 @@ def main():
     p = argparse.ArgumentParser(description="Perplexity evaluation (GPTQ protocol)")
     p.add_argument("--model-path", type=str, required=True)
     p.add_argument("--datasets", type=str, nargs="+", default=["wikitext2"],
-                   choices=["wikitext2", "c4", "ptb"])
+                   choices=["wikitext2", "c4-new", "ptb-new"],
+                   help="c4-new / ptb-new are the GPTQ get_c4_new / get_ptb_new "
+                        "variants. Report the variant name, not bare 'c4'/'ptb'.")
     p.add_argument("--seqlen", type=int, default=2048,
                    help="2048 for Llama-1/2; 8192 for Llama-3/Qwen3. "
                         "Numbers at different seqlen are NOT comparable.")
@@ -279,6 +318,14 @@ def main():
         "dtype": args.dtype,
         **({"stride": args.stride} if args.method == "sliding" else {}),
         "ppl": ppls,
+        # Recorded so a number can be traced back to the exact protocol later.
+        "env": {
+            "tokenizer_class": type(tokenizer).__name__,
+            "tokenizer_is_fast": bool(getattr(tokenizer, "is_fast", False)),
+            "vocab_size": len(tokenizer),
+            "transformers": _transformers_version(),
+            "torch": torch.__version__,
+        },
     }
 
     out = args.out_json or os.path.join(args.model_path, "ppl.json")
