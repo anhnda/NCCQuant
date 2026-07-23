@@ -392,15 +392,33 @@ def main():
     # quantizer-specific knobs (block = standard non-uniform scaling granularity)
     p.add_argument("--nf-block-size", type=int, default=64, help="NF3/NF4 block size (bnb default 64)")
     p.add_argument("--nvfp4-block-size", type=int, default=16, help="NVFP4 micro-block size")
-    p.add_argument("--cb-block-size", type=int, default=-1,
-                   help="learned-codebook / FlexNu block size. Default -1 = FULL ROW "
-                        "(one codebook per output row, spanning all input channels). "
-                        "Pass a positive int (e.g. 64) for block-wise granularity.")
+    p.add_argument("--cb-block-size", type=int, default=64, help="learned-codebook block size")
     p.add_argument("--kmeans-iters", type=int, default=20, help="learned-codebook k-means iters")
     p.add_argument("--row-chunk", type=int, default=1024,
                    help="output rows processed at once (memory bound; no effect on result)")
 
     # ---- FlexNu -----------------------------------------------------------
+    g = p.add_argument_group("LNQ (lnq2/3/4)")
+    g.add_argument("--lnq-iters", type=int, default=15,
+                   help="outer alternations of update_P / update_C")
+    g.add_argument("--lnq-cd-cycles", type=int, default=2,
+                   help="coordinate-descent sweeps over the input columns per update_P")
+    g.add_argument("--lnq-damp", type=float, default=1e-2,
+                   help="Hessian damping as a fraction of mean(diag(G))")
+    g.add_argument("--lnq-ridge", type=float, default=1e-7,
+                   help="ridge on the codebook least-squares solve")
+    g.add_argument("--lnq-cd-block", type=int, default=128,
+                   help="column block for the residual update in update_P")
+    g.add_argument("--lnq-row-block", type=int, default=64,
+                   help="row block for update_C; bounds the [rb, in, K] one-hot")
+    g.add_argument("--lnq-kmeans-init", type=str, default="kmeans++",
+                   choices=["kmeans++", "quantile"],
+                   help="seeding for the SqueezeLLM-style k-means init")
+    g.add_argument("--lnq-unweighted-init", action="store_true",
+                   help="do not weight the k-means init by diag(G)")
+    g.add_argument("--lnq-verbose", action="store_true",
+                   help="print the objective each alternation")
+
     g = p.add_argument_group("FlexNu (flexnu2/3/4)")
     g.add_argument("--flexnu-iters", type=int, default=300,
                    help="Adam steps per row-block.")
@@ -498,6 +516,15 @@ def main():
         flexnu_row_block=args.flexnu_row_block,
         flexnu_lambda_s2=args.flexnu_lambda_s2,
         flexnu_verbose=args.flexnu_verbose,
+        lnq_iters=args.lnq_iters,
+        lnq_cd_cycles=args.lnq_cd_cycles,
+        lnq_damp=args.lnq_damp,
+        lnq_ridge=args.lnq_ridge,
+        lnq_cd_block=args.lnq_cd_block,
+        lnq_row_block=args.lnq_row_block,
+        lnq_kmeans_init=args.lnq_kmeans_init,
+        lnq_unweighted_init=args.lnq_unweighted_init,
+        lnq_verbose=args.lnq_verbose,
     )
     print(f"Loaded quantizer: {quantizer}")
 
