@@ -7,7 +7,10 @@ Public API
     apply_ncc(W_fp, qres, mu, ...) -> (W_corrected, NCCStats)
     apply_bias_correction(module, W_fp, W_q, mu, ...) -> BCStats
 
-Names: nf3, nf4, nvfp4, codebook3, codebook4, flexnu2/3/4, lnq2/3/4.
+Names: nf3, nf4, nvfp4, codebook3, codebook4, flexnu2/3/4.
+
+GuidedQuant is NOT registered here: it needs set_hessian()/set_wgrad(), which
+quantize.py does not call. Use quantize_guidedquant.py, which builds it directly.
 
 Standard granularity (block = contiguous run along input sharing one scale):
     NF3/NF4   block_size 64        (bitsandbytes default)
@@ -31,7 +34,6 @@ from .normalfloat import NormalFloatQuantizer
 from .nvfp4 import NVFP4Quantizer
 from .learned_codebook import LearnedCodebookQuantizer
 from .flexnu import FlexNuQuantizer
-from .lnq import LNQQuantizer
 from .guidedquant import GuidedQuantQuantizer
 from .gram_collect import GramCollector, collect_grams
 from .ncc import apply_ncc, NCCStats, james_stein_mean
@@ -85,26 +87,6 @@ def _flexnu(bits):
     return build
 
 
-def _lnq(bits):
-    def build(**kw):
-        return LNQQuantizer(
-            bits=bits,
-            block_size=kw.get("cb_block_size", None),
-            cd_cycles=kw.get("lnq_cd_cycles", 4),
-            iters=kw.get("lnq_iters", 3),
-            damp=kw.get("lnq_damp", 1e-2),
-            ridge=kw.get("lnq_ridge", 1e-7),
-            cd_block_size=kw.get("lnq_cd_block", 128),
-            row_block=kw.get("lnq_row_block", 64),
-            init_iters=kw.get("n_iters", 50),
-            kmeans_init=kw.get("lnq_kmeans_init", "kmeans++"),
-            weighted_init=not kw.get("lnq_unweighted_init", False),
-            seed=kw.get("seed", 0),
-            verbose=kw.get("lnq_verbose", False),
-        )
-    return build
-
-
 QUANTIZER_REGISTRY = {
     "nf3": _nf3,
     "nf4": _nf4,
@@ -114,14 +96,11 @@ QUANTIZER_REGISTRY = {
     "flexnu2": _flexnu(2),
     "flexnu3": _flexnu(3),
     "flexnu4": _flexnu(4),
-    "lnq2": _lnq(2),
-    "lnq3": _lnq(3),
-    "lnq4": _lnq(4),
 }
 
 
 # Quantizers whose objective needs the full activation Gram G = E[x x^T].
-NEEDS_GRAM = {"flexnu2", "flexnu3", "flexnu4", "lnq2", "lnq3", "lnq4"}
+NEEDS_GRAM = {"flexnu2", "flexnu3", "flexnu4"}
 
 
 def get_quantizer(name: str, **kwargs) -> BaseQuantizer:
@@ -134,7 +113,7 @@ def get_quantizer(name: str, **kwargs) -> BaseQuantizer:
 __all__ = [
     "BaseQuantizer", "QuantResult",
     "NormalFloatQuantizer", "NVFP4Quantizer", "LearnedCodebookQuantizer",
-    "FlexNuQuantizer", "LNQQuantizer", "GuidedQuantQuantizer", "GramCollector", "collect_grams", "NEEDS_GRAM",
+    "FlexNuQuantizer", "GuidedQuantQuantizer", "GramCollector", "collect_grams", "NEEDS_GRAM",
     "apply_ncc", "NCCStats", "james_stein_mean",
     "apply_bias_correction", "compute_bias_correction", "BCStats",
     "get_quantizer", "QUANTIZER_REGISTRY",

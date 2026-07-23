@@ -3,28 +3,24 @@ GuidedQuant: LNQ coordinate descent against SALIENCY-WEIGHTED, PER-GROUP
 Hessians, initialised by SqueezeLLM weighted k-means on squared end-loss
 weight gradients.
 
-Distinct from lnq.py:
+Two modes, selected by what you feed it:
 
-  lnq.py       H = E[x x^T], one per layer; init weighted by diag(G).
-               This is the paper's `nosal` ablation at num_groups=1.
-
-  this module  H[g] = sum_t s_tg x_t x_t^T, one per OUTPUT GROUP;
+  --nosal      H = E[x x^T], unweighted; no wgrad init weighting.
+               This is the paper's `nosal` ablation -- ordinary LNQ.
+  default      H[g] = sum_t s_tg x_t x_t^T, saliency-weighted;
                init weighted by squared end-loss weight gradients.
                This is the published method.
 
 Both signals come from guidedquant_collect.collect_saliency_and_wgrad(), which
 runs one backward pass of the LM cross-entropy over calibration data.
 
-At the default num_groups=1 -- full row, one Hessian per layer -- this module
-and lnq.py run the SAME coordinate descent and differ only in what they are
-given: saliency-weighted sum_t s_t x_t x_t^T versus plain E[x x^T], and a
-per-weight [out, in] gradient init versus a per-channel diag(G) init. That
+At the default num_groups=1 -- full row, one Hessian per layer -- the two modes
+run the SAME coordinate descent and differ only in what they are given. That
 makes the pair a clean ablation of the end-loss signal.
 
 num_groups > 1 adds a second axis: output rows are partitioned and each group
 fits its own Hessian, since output channels within a layer have different
-sensitivity profiles. With num_groups=1 and s == 1 this degenerates exactly
-to lnq.py.
+sensitivity profiles.
 """
 
 from __future__ import annotations
