@@ -149,18 +149,24 @@ class LearnedCodebookQuantizer(BaseQuantizer):
             return (s2 - 2.0 * c * s + c * c * n).clamp_(min=0.0)
 
         def _closest_sq_dist(sorted_centers):
-            """Squared distance from every point to its nearest center. [G,bw]."""
+            """Squared distance from every point to its nearest center. [G,bw].
+
+            Width comes from the input: during k-means++ this is called with
+            c_id centers, not K.
+            """
             sc, _ = torch.sort(sorted_centers, dim=1)
+            k = sc.shape[1]
+            if k == 1:
+                # One center owns everything; no borders to look up.
+                return (sorted_X - sc[:, :1]) ** 2
             b = _borders_from_centers(sc)
-            # Expand each cluster's center over its own span to get, for every
-            # sorted point, the center that owns it.
-            owner_idx = torch.zeros(G, bw, device=device, dtype=torch.long)
-            # b[:, 1:-1] are the interior cut ranks; a point's owner is the
-            # number of cuts at or below its position.
-            for k in range(1, K):
-                owner_idx += (torch.arange(bw, device=device).view(1, -1)
-                              >= b[:, k:k + 1]).long()
-            owner = torch.gather(sc, 1, owner_idx.clamp(max=sc.shape[1] - 1))
+            # A point's owner is its rank among the interior cut positions, and
+            # those cuts are non-decreasing -- so one batched searchsorted over
+            # b[:, 1:-1] replaces a per-cluster comparison loop.
+            cuts = b[:, 1:-1].contiguous()                          # [G, k-1]
+            pos = torch.arange(bw, device=device).view(1, -1).expand(G, bw)
+            owner_idx = torch.searchsorted(cuts, pos.contiguous(), right=True)
+            owner = torch.gather(sc, 1, owner_idx.clamp(max=k - 1))
             return (sorted_X - owner) ** 2
 
         gen = torch.Generator(device=device if device.type != "mps" else "cpu")
