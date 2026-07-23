@@ -2,27 +2,29 @@
 """
 Standalone perplexity evaluation.
 
-PRIMARY METRIC: non-overlapping block PPL, khop protocol GPTQ / AWQ /
-OmniQuant / SpinQuant. Corpus duoc noi lai, tokenize mot lan, cat thanh cac
-block [0:seqlen], [seqlen:2*seqlen], ... Moi block chay doc lap, khong mang
-context tu block truoc, khong mask.
+PRIMARY METRIC: non-overlapping block PPL, matching the GPTQ / AWQ /
+OmniQuant / SpinQuant protocol. The corpus is concatenated, tokenized once,
+then split into blocks [0:seqlen], [seqlen:2*seqlen], ... Each block is scored
+independently: no context carried over from the previous block, no masking.
 
-    Sanity check: Llama-2-7B fp16, wikitext2, seqlen=2048 -> 5.47
+    Sanity check: Llama-2-7B  fp16, wikitext2, seqlen=2048 -> 5.47 (166 blocks)
                   Llama-2-13B fp16, wikitext2, seqlen=2048 -> 4.88
 
-Lech qua 0.02 = con bug o tokenize hoac load model. Dung chay tiep ladder.
+Off by more than 0.02 means a bug in tokenization or model loading, NOT in the
+quantizer. Stop and fix it before running the ablation ladder.
 
-SECONDARY METRIC (--method sliding): overlapping sliding window. Uoc luong PPL
-sat dinh nghia hon (HF goi non-overlapping la xap xi "suboptimal" vi token dau
-moi block bi score voi context rong), NHUNG cho so THAP hon dang ke. Khong bao
-gio dat canh so trong bang paper. Luon ghi ro ctx_len va stride khi bao cao.
+SECONDARY METRIC (--method sliding): overlapping sliding window. A closer
+estimate of true PPL -- HuggingFace calls the non-overlapping split a
+"suboptimal" approximation because the first tokens of each block are scored
+with no context -- BUT it yields noticeably lower numbers. Never place these
+side by side with numbers from a paper table. Always report ctx_len and stride.
 
 Usage:
     python eval_ppl.py --model-path ./quantized_models/flexnu/C_divisor_only \
         --datasets wikitext2 c4 --seqlen 2048
 
     python eval_ppl.py --model-path meta-llama/Llama-2-7b-hf \
-        --datasets wikitext2 --seqlen 2048 --dtype fp16    # -> phai ra 5.47
+        --datasets wikitext2 --seqlen 2048 --dtype fp16    # -> must print 5.47
 """
 
 from __future__ import annotations
@@ -42,19 +44,19 @@ from tqdm import tqdm
 # --------------------------------------------------------------------------- #
 # Corpus loading
 #
-# CRITICAL - ba dieu duoi day quyet dinh con so co khop bang paper hay khong:
-#   1. wikitext2 dung "\n\n".join va KHONG filter dong rong.
-#   2. Tokenize MOT LAN tren toan corpus, KHONG chen BOS thu cong.
-#   3. c4 dung get_c4_new (noi 1100 doc dau, cat 256*seqlen token).
+# CRITICAL - these three details decide whether the numbers match paper tables:
+#   1. wikitext2 uses "\n\n".join and does NOT filter empty lines.
+#   2. Tokenize ONCE over the whole corpus; do NOT insert BOS manually.
+#   3. c4 uses get_c4_new (join first 1100 docs, truncate to 256*seqlen tokens).
 # --------------------------------------------------------------------------- #
 def _load_corpus_ids(name: str, tokenizer, seqlen: int,
                      cache_dir: Optional[Path] = None) -> torch.Tensor:
-    """Tra ve input_ids [1, N] cua toan bo corpus test."""
+    """Return input_ids [1, N] for the entire test corpus."""
     cache_file = None
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
         tok_id = getattr(tokenizer, "name_or_path", "tok").replace("/", "_")
-        # Chi c4 phu thuoc seqlen (cat 256*seqlen); wikitext2/ptb thi khong.
+        # Only c4 depends on seqlen (truncated to 256*seqlen); wikitext2/ptb do not.
         suffix = f"_{seqlen}" if name == "c4" else ""
         cache_file = cache_dir / f"{name}_{tok_id}{suffix}.pkl"
         if cache_file.exists():
@@ -65,11 +67,11 @@ def _load_corpus_ids(name: str, tokenizer, seqlen: int,
 
     if name == "wikitext2":
         ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-        # KHONG filter: giu nguyen ca dong rong, dung nhu GPTQ datautils.py
+        # NO filtering: keep empty lines, exactly as in GPTQ datautils.py
         enc = tokenizer("\n\n".join(ds["text"]), return_tensors="pt").input_ids
 
     elif name == "c4":
-        # get_c4_new: pin revision de moi lan chay ra dung cung mot tap text
+        # get_c4_new: revision pinned so every run sees the same text
         ds = load_dataset(
             "allenai/c4",
             "default",
@@ -108,17 +110,18 @@ def eval_ppl(model, tokenizer, testcases: List[str], seqlen: int = 2048,
         nsamples = enc.numel() // seqlen
         if nsamples == 0:
             if verbose:
-                print(f"{name}: corpus ngan hon seqlen, bo qua")
+                print(f"{name}: corpus shorter than seqlen, skipping")
             continue
 
         nlls = []
         for i in tqdm(range(nsamples), disable=not verbose, desc=f"{name}"):
             batch = enc[:, i * seqlen : (i + 1) * seqlen].to(device)
             out = model(batch, labels=batch)
-            # out.loss la mean tren (seqlen - 1) token duoc score.
-            # Nhan seqlen o day va chia nsamples*seqlen o duoi: he so triet tieu,
-            # ket qua giong het dung (seqlen - 1) o ca hai cho. Giu seqlen de
-            # khop nguyen van repo GPTQ goc.
+            # out.loss is the mean over (seqlen - 1) scored tokens.
+            # Multiplying by seqlen here and dividing by nsamples*seqlen below:
+            # the factor cancels, so the result is identical to using
+            # (seqlen - 1) in both places. Kept as seqlen to match the original
+            # GPTQ repo verbatim.
             nlls.append(out.loss.float() * seqlen)
 
         ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * seqlen)).item()
@@ -158,23 +161,23 @@ def eval_ppl_sliding(model, tokenizer, testcases: List[str], ctx_len: int = 2048
         for begin in tqdm(range(0, seq_len, stride), disable=not verbose,
                           desc=f"{name} (sliding)"):
             end = min(begin + ctx_len, seq_len)
-            trg_len = end - prev_end          # so token MOI trong window nay
+            trg_len = end - prev_end          # number of NEW tokens in this window
             if trg_len <= 0:
-                # window nay khong them token moi nao (xay ra khi stride > ctx_len
-                # hoac o window cuoi bi cat ngan) -> bo qua, tranh mask sai
+                # This window adds no new tokens (happens when stride > ctx_len,
+                # or on a truncated final window) -> skip to avoid bad masking.
                 if end == seq_len:
                     break
                 continue
             chunk = enc[:, begin:end]
 
             target = chunk.clone()
-            n_ctx = chunk.size(1) - trg_len   # so token context can mask
+            n_ctx = chunk.size(1) - trg_len   # context tokens to mask out
             if n_ctx > 0:
                 target[:, :n_ctx] = -100
 
             out = model(chunk, labels=target)
-            # HF shift labels: token thu i duoc du doan tu token < i.
-            # So token thuc su co loss = so label != -100 sau khi shift.
+            # HF shifts labels: token i is predicted from tokens < i.
+            # Tokens actually contributing loss = labels != -100 after the shift.
             valid = int((target[:, 1:] != -100).sum().item())
             if valid == 0:
                 prev_end = end
@@ -217,21 +220,22 @@ def main():
     p.add_argument("--datasets", type=str, nargs="+", default=["wikitext2"],
                    choices=["wikitext2", "c4", "ptb"])
     p.add_argument("--seqlen", type=int, default=2048,
-                   help="2048 cho Llama-1/2; 8192 cho Llama-3/Qwen3. "
-                        "So o seqlen khac nhau KHONG so duoc voi nhau.")
+                   help="2048 for Llama-1/2; 8192 for Llama-3/Qwen3. "
+                        "Numbers at different seqlen are NOT comparable.")
     p.add_argument("--method", type=str, default="block",
                    choices=["block", "sliding"],
-                   help="block = non-overlapping (chuan paper); "
-                        "sliding = overlapping (so thap hon, metric phu)")
+                   help="block = non-overlapping (paper standard); "
+                        "sliding = overlapping (lower numbers, secondary metric)")
     p.add_argument("--stride", type=int, default=512,
-                   help="chi dung khi --method sliding")
+                   help="only used with --method sliding")
     p.add_argument("--dtype", type=str, default="fp16", choices=list(_DTYPES))
     p.add_argument("--device-map", type=str, default="auto")
     p.add_argument("--cache-dir", type=str, default="./dataset_cache",
-                   help="cache token da hoa; '' de tat")
+                   help="cache for tokenized corpora; '' to disable")
     p.add_argument("--out-json", type=str, default=None,
-                   help="mac dinh: <model-path>/ppl.json")
-    p.add_argument("--tag", type=str, default=None)
+                   help="default: <model-path>/ppl.json")
+    p.add_argument("--tag", type=str, default=None,
+                   help="label recorded in the json (e.g. the ablation cell)")
     args = p.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -253,7 +257,7 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        dtype=dtype,
+        torch_dtype=dtype,
         device_map=args.device_map,
         trust_remote_code=True,
     )
