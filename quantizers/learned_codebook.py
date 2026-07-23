@@ -44,9 +44,11 @@ class LearnedCodebookQuantizer(BaseQuantizer):
         Wb : [G, bw]  (G = rows-in-chunk * n_blocks flattened, bw = block width)
         returns centers [G, K] sorted ascending, strictly increasing.
 
-        Works at any bw, including full-row (bw = in_features). Peak memory is
-        O(G * bw) for the sort plus one fp64 prefix-sum buffer, so at full row
-        `row_chunk` is the knob to turn down if memory is tight.
+        Init is k-means++ (ported from flash1dkmeans, unweighted variant),
+        batched across G; refinement is Lloyd on the sorted array. Works at any
+        bw, including full-row (bw = in_features). Peak memory is O(G * bw) for
+        the sort plus two fp64 prefix-sum buffers, so at full row `row_chunk` is
+        the knob to turn down if memory is tight.
         """
         G, bw = Wb.shape
         K = self.num_levels
@@ -70,13 +72,21 @@ class LearnedCodebookQuantizer(BaseQuantizer):
         # large partial sums, which fp32 cancels badly.
         psum = torch.zeros(G, bw + 1, device=device, dtype=torch.float64)
         psum[:, 1:] = torch.cumsum(sorted_X.double(), dim=1)
+        # Squared prefix sum: lets inertia of any contiguous run be read in O(1)
+        # via  sum(x^2) - 2*c*sum(x) + c^2*n.  This is what makes k-means++
+        # affordable here -- each candidate's inertia is K prefix-sum lookups
+        # instead of a pass over the data.
+        psum_sq = torch.zeros(G, bw + 1, device=device, dtype=torch.float64)
+        psum_sq[:, 1:] = torch.cumsum(sorted_X.double() ** 2, dim=1)
 
         def _centroids(lo, hi):
             """Mean of sorted_X[:, lo:hi) from prefix sums. lo,hi: [G,K] long.
 
-            Borders are non-decreasing, so these means come out ascending
-            already; empty clusters are the only exception and are patched
-            below.
+            Non-empty clusters come out ascending automatically. Empty clusters
+            do not: the fallback below is a border *sample*, not a mean, and a
+            sample can sit below the mean of the wide cluster to its left. The
+            midpoint recut assumes ascending centers, so we restore that
+            explicitly before returning.
             """
             n = (hi - lo).clamp(min=1).double()
             s = torch.gather(psum, 1, hi) - torch.gather(psum, 1, lo)
@@ -84,31 +94,124 @@ class LearnedCodebookQuantizer(BaseQuantizer):
             empty = (hi - lo) <= 0
             if bool(empty.any()):
                 # An empty cluster has no mass; park it on the data point at its
-                # own border so it stays in order and stays a valid level.
+                # own border. NOTE lo indexes psum (0..bw) but we are reading
+                # sorted_X (0..bw-1), hence the clamp -- without it, a border at
+                # bw is out of range; with it, every empty cluster at the right
+                # edge maps to the row max, which is why the cummax below is
+                # load-bearing rather than decorative.
                 fallback = torch.gather(sorted_X, 1, lo.clamp(max=bw - 1))
                 mean = torch.where(empty, fallback, mean)
+                # Restore the ascending invariant the recut depends on. Without
+                # this a single empty cluster makes `mid` non-monotonic, which
+                # makes searchsorted return out-of-order ranks, which the border
+                # cummax then flattens into a run of equal borders -- creating
+                # more empty clusters each pass until the levels collapse.
+                mean, _ = torch.cummax(mean, dim=1)
             return mean
 
-        # ---- init borders by equal MASS, then refine ------------------------
-        # Equal-mass (rank) cuts are the right starting point on a sorted array:
-        # unlike equal-value cuts they can never produce an empty cluster.
-        borders = torch.linspace(0, bw, K + 1, device=device)
-        borders = borders.round().long().view(1, K + 1).expand(G, K + 1).contiguous()
+        # ---- init by k-means++ (ported from flash1dkmeans) ------------------
+        # Batched port of flash1dkmeans._kmeans_plusplus_unweighted. The numba
+        # original runs one row at a time; here every row in the chunk draws its
+        # own centers simultaneously, so searchsorted/inertia are single batched
+        # kernels rather than a G-long Python loop.
+        #
+        # Why k-means++ over equal-rank cuts: rank cuts spend levels in
+        # proportion to COUNT, and an LLM weight row is a spike at 0 with rare
+        # outliers, so nearly every level lands inside the spike and the tails
+        # get nothing. k-means++ samples proportional to squared distance, which
+        # is exactly the signal that pulls seeds out to the outliers.
+
+        def _borders_from_centers(sorted_centers):
+            """Cluster borders = rank of each midpoint. [G,k] -> [G,k+1].
+
+            k is taken from the input, not fixed at K: during k-means++ this is
+            called on partial center sets of width c_id+1.
+            """
+            k = sorted_centers.shape[1]
+            mid = 0.5 * (sorted_centers[:, 1:] + sorted_centers[:, :-1])
+            b = torch.empty(G, k + 1, device=device, dtype=torch.long)
+            b[:, 0] = 0
+            b[:, -1] = bw
+            if k > 1:
+                b[:, 1:-1] = torch.searchsorted(sorted_X.contiguous(), mid.contiguous())
+            return b.clamp_(0, bw)
+
+        def _inertia_per_cluster(sorted_centers, b):
+            """Weighted SSE of each cluster, [G,K], from the prefix sums.
+
+            sum(w*(x-c)^2) = sum(x^2) - 2c*sum(x) + c^2*n, all O(1) per cluster.
+            """
+            lo, hi = b[:, :-1], b[:, 1:]
+            n = (hi - lo).double()
+            s = torch.gather(psum, 1, hi) - torch.gather(psum, 1, lo)
+            s2 = torch.gather(psum_sq, 1, hi) - torch.gather(psum_sq, 1, lo)
+            c = sorted_centers.double()
+            return (s2 - 2.0 * c * s + c * c * n).clamp_(min=0.0)
+
+        def _closest_sq_dist(sorted_centers):
+            """Squared distance from every point to its nearest center. [G,bw]."""
+            sc, _ = torch.sort(sorted_centers, dim=1)
+            b = _borders_from_centers(sc)
+            # Expand each cluster's center over its own span to get, for every
+            # sorted point, the center that owns it.
+            owner_idx = torch.zeros(G, bw, device=device, dtype=torch.long)
+            # b[:, 1:-1] are the interior cut ranks; a point's owner is the
+            # number of cuts at or below its position.
+            for k in range(1, K):
+                owner_idx += (torch.arange(bw, device=device).view(1, -1)
+                              >= b[:, k:k + 1]).long()
+            owner = torch.gather(sc, 1, owner_idx.clamp(max=sc.shape[1] - 1))
+            return (sorted_X - owner) ** 2
+
+        gen = torch.Generator(device=device if device.type != "mps" else "cpu")
+        gen.manual_seed(self.seed)
+
+        def _rand_unit(*shape):
+            return torch.rand(*shape, device=device, generator=gen)
+
+        centers_pp = torch.empty(G, K, device=device, dtype=sorted_X.dtype)
+        # First center: uniform over the row's points, independently per row.
+        first = (_rand_unit(G, 1) * bw).long().clamp_(0, bw - 1)
+        centers_pp[:, :1] = torch.gather(sorted_X, 1, first)
+
+        n_local_trials = 2 + int(torch.log(torch.tensor(float(K))).item())
+
+        for c_id in range(1, K):
+            # D2 sampling: draw candidates with P(x) proportional to its squared
+            # distance to the nearest chosen center.
+            d2 = _closest_sq_dist(centers_pp[:, :c_id]).double()
+            cw = torch.cumsum(d2, dim=1)                            # [G, bw]
+            total = cw[:, -1:].clamp(min=1e-30)
+            sel = _rand_unit(G, n_local_trials).double() * total    # [G, L]
+            cand_idx = torch.searchsorted(cw.contiguous(), sel.contiguous())
+            cand_idx = cand_idx.clamp_(0, bw - 1)
+            cand = torch.gather(sorted_X, 1, cand_idx)              # [G, L]
+
+            # Score each candidate by the TOTAL inertia it would produce, and
+            # keep the best -- the "greedy k-means++" local-trials step.
+            best_inertia = torch.full((G,), float("inf"), device=device, dtype=torch.float64)
+            best_cand = cand[:, 0].clone()
+            for t in range(n_local_trials):
+                trial = torch.cat([centers_pp[:, :c_id], cand[:, t:t + 1]], dim=1)
+                trial, _ = torch.sort(trial, dim=1)
+                b_t = _borders_from_centers(trial)
+                inertia = _inertia_per_cluster(trial, b_t)[:, :c_id + 1].sum(dim=1)
+                better = inertia < best_inertia
+                best_inertia = torch.where(better, inertia, best_inertia)
+                best_cand = torch.where(better, cand[:, t], best_cand)
+            centers_pp[:, c_id] = best_cand
+
+        centers_pp, _ = torch.sort(centers_pp, dim=1)
+        borders = _borders_from_centers(centers_pp)
+        borders, _ = torch.cummax(borders, dim=1)
+        borders[:, -1] = bw
 
         # Lloyd on the sorted array: recompute centroids, then recut at the
         # midpoints. Each recut is a searchsorted, so this is O(K log bw).
         for _ in range(self.n_iters):
             centers = _centroids(borders[:, :-1], borders[:, 1:])  # [G, K]
-
-            mid = 0.5 * (centers[:, 1:] + centers[:, :-1])         # [G, K-1]
-            # New borders = rank of each midpoint in the sorted row.
-            inner = torch.searchsorted(sorted_X.contiguous(), mid.contiguous())
-            new_borders = torch.empty_like(borders)
-            new_borders[:, 0] = 0
-            new_borders[:, -1] = bw
-            new_borders[:, 1:-1] = inner
+            new_borders = _borders_from_centers(centers)
             # Keep borders non-decreasing and in range.
-            new_borders = new_borders.clamp(0, bw)
             new_borders, _ = torch.cummax(new_borders, dim=1)
             new_borders[:, -1] = bw
             if torch.equal(new_borders, borders):
@@ -126,6 +229,16 @@ class LearnedCodebookQuantizer(BaseQuantizer):
         for k in range(1, K):
             bad = centers[:, k] <= centers[:, k - 1]
             centers[:, k] = torch.where(bad, centers[:, k - 1] + eps, centers[:, k])
+
+        # The eps fan-out can walk the tail past the row max; a level above the
+        # max is never the nearest codeword, so it is a wasted codeword. Pull
+        # the whole ladder back inside [min, max] while keeping it increasing.
+        lo_b = sorted_X[:, :1]                                     # [G, 1]
+        hi_b = sorted_X[:, -1:]                                    # [G, 1]
+        ramp = torch.arange(K, device=device, dtype=centers.dtype) # [K]
+        floor = lo_b + ramp * eps.unsqueeze(1)
+        ceil = hi_b - (K - 1 - ramp) * eps.unsqueeze(1)
+        centers = torch.maximum(torch.minimum(centers, ceil), floor)
         return centers
 
     @torch.no_grad()
@@ -152,6 +265,10 @@ class LearnedCodebookQuantizer(BaseQuantizer):
                 Wb = Wr[:, c0:c1]                              # [rc, bw]
                 centers = self._kmeans_blocks(Wb)             # [rc, K]
                 block_codebooks[r0:r1, b, :] = centers
+                # Informational only: centers are absolute, and dequant is a
+                # plain gather from them, so no scale is applied anywhere in
+                # this quantizer. Any consumer that multiplies by block_scales
+                # (as it would for a fixed-grid quantizer) will double-scale.
                 block_scales[r0:r1, b] = Wb.abs().amax(dim=1)
 
                 # centers is strictly increasing, so nearest-codeword is a
