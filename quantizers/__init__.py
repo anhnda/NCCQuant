@@ -10,9 +10,13 @@ Public API
 Names: nf3, nf4, nvfp4, codebook3, codebook4, flexnu2, flexnu3, flexnu4.
 
 Standard granularity (block = contiguous run along input sharing one scale):
-    NF3/NF4   block_size 64   (bitsandbytes default)
-    NVFP4     block_size 16   (NVIDIA), FP8 E4M3 block scale
-    codebook  block_size 64   (per-block learned levels)
+    NF3/NF4   block_size 64        (bitsandbytes default)
+    NVFP4     block_size 16        (NVIDIA), FP8 E4M3 block scale
+    codebook  full row (default)   one learned codebook per output row
+    flexnu    full row (default)   one learned codebook per output row
+
+    cb_block_size=None or <=0 selects full row; pass a positive int for
+    classic block-wise granularity.
 
 Contract:
     res = quantizer.quantize(W, row_chunk=1024)   # block-wise, OOM-safe
@@ -46,12 +50,12 @@ def _nvfp4(**kw):
 
 
 def _codebook3(**kw):
-    return LearnedCodebookQuantizer(bits=3, block_size=kw.get("cb_block_size", 64),
+    return LearnedCodebookQuantizer(bits=3, block_size=kw.get("cb_block_size", None),
                                     n_iters=kw.get("n_iters", 20), seed=kw.get("seed", 0))
 
 
 def _codebook4(**kw):
-    return LearnedCodebookQuantizer(bits=4, block_size=kw.get("cb_block_size", 64),
+    return LearnedCodebookQuantizer(bits=4, block_size=kw.get("cb_block_size", None),
                                     n_iters=kw.get("n_iters", 20), seed=kw.get("seed", 0))
 
 
@@ -59,7 +63,7 @@ def _flexnu(bits):
     def build(**kw):
         return FlexNuQuantizer(
             bits=bits,
-            block_size=kw.get("cb_block_size", 64),
+            block_size=kw.get("cb_block_size", None),
             iters=kw.get("flexnu_iters", 300),
             lr_scale=kw.get("flexnu_lr_scale", 3e-3),
             lr_cb=kw.get("flexnu_lr_cb", 1e-5),

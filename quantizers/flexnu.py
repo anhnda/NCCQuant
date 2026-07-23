@@ -285,7 +285,7 @@ class FlexNuQuantizer(BaseQuantizer):
 
     def __init__(self,
                  bits: int,
-                 block_size: int = 64,
+                 block_size: int | None = None,
                  iters: int = 300,
                  lr_scale: float = 3e-3,
                  lr_cb: float = 1e-5,
@@ -441,7 +441,7 @@ class FlexNuQuantizer(BaseQuantizer):
         wdt = self.work_dtype
         R, pin = Wrows.shape
         K = self.num_levels
-        bs = self.block_size
+        bs = self._resolve_block_size(in_features)
         nb = pin // bs
 
         Wb = Wrows.reshape(R, nb, bs).to(wdt)                # [R, nb, bs]
@@ -661,7 +661,7 @@ class FlexNuQuantizer(BaseQuantizer):
         wdt = self.work_dtype
         out_features, in_features = W.shape
         K = self.num_levels
-        bs = self.block_size
+        bs = self._resolve_block_size(in_features)
         nb = (in_features + bs - 1) // bs
         pin = nb * bs
 

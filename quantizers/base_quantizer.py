@@ -78,9 +78,20 @@ class BaseQuantizer(ABC):
 
     name: str = "base"
 
-    def __init__(self, bits: int, block_size: int = 64):
+    def __init__(self, bits: int, block_size: int | None = None):
+        """block_size=None or <=0 means FULL ROW (one block spanning all inputs)."""
         self.bits = bits
-        self.block_size = block_size
+        if block_size is None or int(block_size) <= 0:
+            block_size = -1          # sentinel: full row, resolved in quantize()
+        self.block_size = int(block_size)
+
+    @property
+    def full_row(self) -> bool:
+        return self.block_size <= 0
+
+    def _resolve_block_size(self, in_features: int) -> int:
+        """Concrete block size for a layer; full row -> in_features."""
+        return in_features if self.block_size <= 0 else self.block_size
 
     # ------------------------------------------------------------------ #
     # Subclass contract
@@ -119,7 +130,7 @@ class BaseQuantizer(ABC):
         qlo = q.min()
         qhi = q.max()
         qspan = (qhi - qlo).clamp(min=1e-12)
-        bs = self.block_size
+        bs = self._resolve_block_size(in_features)
         n_blocks = (in_features + bs - 1) // bs
 
         W_dequant = torch.empty_like(W)
@@ -176,5 +187,6 @@ class BaseQuantizer(ABC):
         )
 
     def __repr__(self) -> str:
+        bs_str = "full_row" if self.full_row else str(self.block_size)
         return (f"{self.__class__.__name__}(name={self.name!r}, bits={self.bits}, "
-                f"block_size={self.block_size}, asym={ASYM})")
+                f"block_size={bs_str}, asym={ASYM})")

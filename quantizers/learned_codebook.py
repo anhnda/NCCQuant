@@ -5,6 +5,10 @@ A learned codebook drops the fixed shape: the 2**bits levels are searched from t
 weights themselves by 1-D k-means (Lloyd) per (row, block). This is inherently
 asymmetric — centers are free to sit anywhere — so the global ASYM flag does not
 change it. Realised levels are stored in block_codebooks for NCC to read.
+
+Default granularity is FULL ROW: block_size=None (or <=0) means one block per
+output row spanning every input channel, i.e. one learned codebook per row.
+Pass an explicit positive block_size to get the classic block-wise behaviour.
 """
 
 from __future__ import annotations
@@ -17,7 +21,8 @@ from .base_quantizer import BaseQuantizer, QuantResult
 class LearnedCodebookQuantizer(BaseQuantizer):
     """Per-(row, block) learned scalar codebook via 1-D k-means."""
 
-    def __init__(self, bits: int, block_size: int = 64, n_iters: int = 20, seed: int = 0):
+    def __init__(self, bits: int, block_size: int | None = None,
+                 n_iters: int = 20, seed: int = 0):
         if bits not in (3, 4):
             raise ValueError(f"LearnedCodebook supports bits in {{3,4}}, got {bits}")
         super().__init__(bits=bits, block_size=block_size)
@@ -76,7 +81,7 @@ class LearnedCodebookQuantizer(BaseQuantizer):
         device = W.device
         out_features, in_features = W.shape
         K = self.num_levels
-        bs = self.block_size
+        bs = self._resolve_block_size(in_features)
         n_blocks = (in_features + bs - 1) // bs
 
         W_dequant = torch.empty_like(W)

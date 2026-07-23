@@ -92,7 +92,9 @@ echo "ppl:      $PPL_DIR"
 echo "keep:     ${KEEP_CKPT:-<none, checkpoints deleted after eval>}"
 
 BITS=${BITS:-3}
-CB_BLOCK=${CB_BLOCK:-64}
+# -1 = FULL ROW (default): one learned codebook per output row, spanning all
+# input channels. Set CB_BLOCK=64 (or any positive int) for block-wise.
+CB_BLOCK=${CB_BLOCK:--1}
 N_CALIB=${N_CALIB:-128}
 CALIB_LEN=${CALIB_LEN:-512}     # calibration seqlen; unrelated to eval SEQLEN
 
@@ -187,7 +189,8 @@ fi
 # Header records the protocol, since PPL at different seqlen/method is not
 # comparable and a bare table of numbers loses that.
 {
-  echo "# model=$MODEL_PATH bits=$BITS block=$CB_BLOCK"
+  if [ "$CB_BLOCK" -le 0 ]; then CB_BLOCK_STR="full_row"; else CB_BLOCK_STR="$CB_BLOCK"; fi
+  echo "# model=$MODEL_PATH bits=$BITS block=$CB_BLOCK_STR"
   if [ "$EVAL_METHOD" = "sliding" ]; then
     echo "# eval: method=sliding seqlen=$SEQLEN stride=$EVAL_STRIDE dtype=$EVAL_DTYPE"
   else

@@ -46,7 +46,7 @@ Usage
     python run_synthetic.py --device cuda        # if you want it on GPU
 
 Numbers in the paper were produced with the defaults below:
-    --out-features 64 --in-features 256 --block-size 64 --bits 3
+    --out-features 64 --in-features 256 --bits 3        # full row (default)
     --iters 600 --seeds 3
 """
 
@@ -363,7 +363,8 @@ def main():
     g = p.add_argument_group("problem")
     g.add_argument("--out-features", type=int, default=64)
     g.add_argument("--in-features", type=int, default=256)
-    g.add_argument("--block-size", type=int, default=64)
+    g.add_argument("--block-size", type=int, default=-1,
+                   help="-1 = FULL ROW (default); positive int = block-wise")
     g.add_argument("--bits", type=int, default=3, choices=[2, 3, 4])
     g.add_argument("--weight-std", type=float, default=0.05)
     g.add_argument("--n-tokens", type=int, default=4096)
@@ -400,7 +401,8 @@ def main():
     print(f"FlexNu synthetic validation | device={args.device} "
           f"seeds={args.seeds} bits={args.bits} "
           f"W=[{args.out_features},{args.in_features}] "
-          f"block={args.block_size} iters={args.iters}")
+          f"block={'full_row' if args.block_size <= 0 else args.block_size} "
+          f"iters={args.iters}")
 
     res = {"config": vars(args)}
     if "main" in args.exp:
