@@ -176,12 +176,15 @@ white-noise activations every row collapses to zero and the comparison is void.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
 
 from .base_quantizer import BaseQuantizer, QuantResult
 from .learned_codebook import LearnedCodebookQuantizer
+
+_DEBUG_FLEXNU = os.environ.get("CB_DEBUG", "") == "1"
 
 
 # --------------------------------------------------------------------------- #
@@ -393,8 +396,17 @@ class FlexNuQuantizer(BaseQuantizer):
 
     # ------------------------------------------------------------------ #
     @torch.no_grad()
-    def _init_codebook(self, Wb: torch.Tensor) -> torch.Tensor:
-        """Initial sorted codebook per block. Wb: [R, n_blocks, bw] -> [R, n_blocks, K]."""
+    def _init_codebook(self, Wb: torch.Tensor,
+                       G: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Initial sorted codebook per block. Wb: [R, n_blocks, bw] -> [R, n_blocks, K].
+
+        When G is given, the k-means init is WEIGHTED by diag(G) = E[x_j^2],
+        the SqueezeLLM sensitivity signal: a weight on a high-energy input
+        channel moves the output more, so it deserves a closer level. The
+        FlexNu objective is Tr(R G R^T), and diag(G) is exactly its diagonal
+        part -- so this seeds the optimiser with a codebook already aligned to
+        the objective it is about to minimise, instead of a plain-MSE one.
+        """
         R, nb, bw = Wb.shape
         K = self.num_levels
         flat = Wb.reshape(R * nb, bw)
@@ -407,7 +419,22 @@ class FlexNuQuantizer(BaseQuantizer):
                 seed=self.seed,
             )
             helper.num_levels = K          # support bits=2 through the same routine
-            centers = helper._kmeans_blocks(flat)            # [R*nb, K]
+
+            sw = None
+            if G is not None:
+                # diag(G) is per-input-channel; reshape to per-block so each
+                # block sees the channels it actually owns, then broadcast over
+                # rows (the sensitivity is a property of the channel, not the
+                # output row).
+                d = torch.diagonal(G).to(device=flat.device, dtype=flat.dtype)
+                d = d.clamp(min=0)
+                if d.numel() == nb * bw:
+                    sw = d.view(1, nb, bw).expand(R, nb, bw).reshape(R * nb, bw)
+                elif _DEBUG_FLEXNU:
+                    print(f"[flexnu] diag(G) numel={d.numel()} != nb*bw={nb*bw}; "
+                          f"falling back to unweighted init", flush=True)
+
+            centers = helper._kmeans_blocks(flat, sample_weight=sw)  # [R*nb, K]
         else:
             q = self.init_levels.to(device=flat.device, dtype=flat.dtype)
             q, _ = torch.sort(q)
@@ -447,7 +474,7 @@ class FlexNuQuantizer(BaseQuantizer):
         Wb = Wrows.reshape(R, nb, bs).to(wdt)                # [R, nb, bs]
 
         # ---- init: codebook from k-means / levels, deltas at 0 --------------
-        cb0 = self._init_codebook(Wb)                        # [R, nb, K]
+        cb0 = self._init_codebook(Wb, G)                     # [R, nb, K]
         anchor0 = cb0[..., :1].clone()                       # [R, nb, 1]
         gaps0 = self._inv_softplus(cb0[..., 1:] - cb0[..., :-1])   # [R, nb, K-1]
 

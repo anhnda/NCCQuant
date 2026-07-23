@@ -43,29 +43,58 @@ class LearnedCodebookQuantizer(BaseQuantizer):
         return torch.linspace(-1.0, 1.0, self.num_levels)
 
     @torch.no_grad()
-    def _kmeans_blocks(self, Wb: torch.Tensor) -> torch.Tensor:
+    def _kmeans_blocks(self, Wb: torch.Tensor,
+                       sample_weight: torch.Tensor | None = None) -> torch.Tensor:
         """Vectorised 1-D Lloyd k-means over a stack of blocks.
 
         Wb : [G, bw]  (G = rows-in-chunk * n_blocks flattened, bw = block width)
+        sample_weight : [G, bw] or [1, bw] or None. Per-element importance, as
+            in SqueezeLLM: the objective becomes sum(s_i * (w_i - c)^2) instead
+            of sum((w_i - c)^2), so levels concentrate where errors actually
+            propagate. None -> plain unweighted k-means (unchanged behaviour).
         returns centers [G, K] sorted ascending, strictly increasing.
         """
         G, bw = Wb.shape
         K = self.num_levels
         device = Wb.device
 
+        sw = None
+        if sample_weight is not None:
+            sw = sample_weight.to(device=device, dtype=Wb.dtype)
+            if sw.dim() == 1:
+                sw = sw.view(1, -1)
+            if sw.shape[0] == 1 and G > 1:
+                sw = sw.expand(G, bw)
+            sw = sw.clamp(min=0)
+
         # torch.quantile refuses inputs past ~16M elements in the reduced dim
         # (it sorts internally and the impl caps it). Sort once ourselves and
         # read the quantiles off as fractional indices: identical result to
         # torch.quantile(..., interpolation='linear'), no cap. The sorted copy
         # is reused by the Lloyd assignment below.
-        sorted_X, _ = torch.sort(Wb, dim=1)                        # [G, bw]
+        sorted_X, sort_idx = torch.sort(Wb, dim=1)                 # [G, bw]
         qs = torch.linspace(0.0, 1.0, K, device=device, dtype=torch.float32)
-        pos = qs * (bw - 1)                                        # [K]
-        lo_i = pos.floor().long().clamp(0, bw - 1)
-        hi_i = pos.ceil().long().clamp(0, bw - 1)
-        frac = (pos - lo_i.to(pos.dtype)).to(sorted_X.dtype)       # [K]
-        centers = sorted_X[:, lo_i] + (sorted_X[:, hi_i] - sorted_X[:, lo_i]) * frac
-        centers = centers.contiguous()                             # [G, K]
+
+        if sw is None:
+            # Unweighted: quantile position is a plain fractional rank.
+            pos = qs * (bw - 1)                                    # [K]
+            lo_i = pos.floor().long().clamp(0, bw - 1)
+            hi_i = pos.ceil().long().clamp(0, bw - 1)
+            frac = (pos - lo_i.to(pos.dtype)).to(sorted_X.dtype)   # [K]
+            centers = sorted_X[:, lo_i] + (sorted_X[:, hi_i] - sorted_X[:, lo_i]) * frac
+            centers = centers.contiguous()                         # [G, K]
+        else:
+            # Weighted: cut at equal WEIGHT MASS rather than equal count, so the
+            # seed already reflects importance. Per-row, since the weight mass
+            # differs by row once sw is expanded.
+            sw_sorted = torch.gather(sw, 1, sort_idx)              # [G, bw]
+            cw = torch.cumsum(sw_sorted.double(), dim=1)           # [G, bw]
+            total = cw[:, -1:].clamp(min=1e-30)
+            targets = qs.double().view(1, -1) * total              # [G, K]
+            idx = torch.searchsorted(cw.contiguous(), targets.contiguous())
+            idx = idx.clamp_(0, bw - 1)
+            centers = torch.gather(sorted_X, 1, idx).contiguous()  # [G, K]
+
         zc = centers.abs().argmin(dim=1)
         centers[torch.arange(G, device=device), zc] = 0.0
         centers, _ = torch.sort(centers, dim=1)
@@ -85,9 +114,24 @@ class LearnedCodebookQuantizer(BaseQuantizer):
             new_centers = centers.clone()
             for k in range(K):
                 mask = (assign == k)
-                cnt = mask.sum(dim=1).clamp(min=1)
-                summ = (Wb * mask).sum(dim=1)
-                mean_k = summ / cnt
+                if sw is None:
+                    denom = mask.sum(dim=1).clamp(min=1).to(Wb.dtype)
+                    summ = (Wb * mask).sum(dim=1)
+                else:
+                    # SqueezeLLM objective: centroid is the WEIGHTED mean.
+                    m = mask.to(Wb.dtype) * sw
+                    denom = m.sum(dim=1)
+                    summ = (Wb * m).sum(dim=1)
+                    # A cluster whose total weight is zero contributes nothing to
+                    # the objective; fall back to the unweighted mean so the level
+                    # still lands on its own data instead of dividing by zero.
+                    zero_w = denom <= 0
+                    if bool(zero_w.any()):
+                        cnt = mask.sum(dim=1).clamp(min=1).to(Wb.dtype)
+                        summ = torch.where(zero_w, (Wb * mask).sum(dim=1), summ)
+                        denom = torch.where(zero_w, cnt, denom)
+                    denom = denom.clamp(min=1e-30)
+                mean_k = summ / denom
                 owns = mask.any(dim=1)
                 new_centers[:, k] = torch.where(owns, mean_k, centers[:, k])
             centers, _ = torch.sort(new_centers, dim=1)
