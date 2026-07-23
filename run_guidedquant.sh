@@ -56,7 +56,7 @@ set -euo pipefail
 MODEL_PATH=${MODEL_PATH:-/path/to/Mistral-7B-v0.3}
 OUT_ROOT=${OUT_ROOT:-./quantized_models/guidedquant}
 LOG_DIR=${LOG_DIR:-./logs}
-KEEP_CKPT=${KEEP_CKPT:-L_lnq3}          # ""=none, 1=all, or space-separated cell names
+KEEP_CKPT=${KEEP_CKPT:-}          # ""=none, 1=all, or space-separated cell names
 
 # ---- eval protocol --------------------------------------------------------
 # seqlen 2048 for Llama-1/2 and Mistral; 8192 for Llama-3 / Qwen3. Numbers at
