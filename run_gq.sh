@@ -51,11 +51,19 @@ CALIB_DATASET=${CALIB_DATASET:-wikitext2}
 ITERS=${ITERS:-3}
 CD_CYCLES=${CD_CYCLES:-4}
 RIDGE=${RIDGE:-1e-7}
-ROW_BLOCK=${ROW_BLOCK:-64}
+# Memory-only batching along the OUTPUT dim. Neither changes the result: every
+# output row gets its own codebook regardless of how they are batched. Lower
+# them if you OOM. Input-side granularity is ALWAYS full row -- there is no
+# input blocking in this method.
+INIT_ROW_BATCH=${INIT_ROW_BATCH:-1024}   # k-means init; prefix sums [b, in+1] fp64
+SOLVE_ROW_BATCH=${SOLVE_ROW_BATCH:-64}   # update_C; one-hot [b, in, K]
+
+# NOT a memory knob. CD_BLOCK sets the residual propagation order inside
+# update_P, so changing it changes the assignments. The reference hardcodes 128.
 CD_BLOCK=${CD_BLOCK:-128}
+
 KMEANS_INIT=${KMEANS_INIT:-kmeans++}
 INIT_ITERS=${INIT_ITERS:-50}
-ROW_CHUNK=${ROW_CHUNK:-1024}
 
 # Phase-1 artefacts are expensive and model-specific, not cell-specific:
 # compute once, reuse across cells.
@@ -181,9 +189,9 @@ cell_gq () {
     --model-path "$MODEL_PATH" --bits $BITS --num-groups $NUM_GROUPS \
     --n-calib $N_CALIB --seq-len $CALIB_LEN --calib-dataset $CALIB_DATASET \
     --iters $ITERS --cd-cycles $CD_CYCLES --ridge $RIDGE \
-    --row-block $ROW_BLOCK --cd-block $CD_BLOCK \
+    --solve-row-batch $SOLVE_ROW_BATCH --cd-block $CD_BLOCK \
     --kmeans-init $KMEANS_INIT --init-iters $INIT_ITERS \
-    --row-chunk $ROW_CHUNK --saliency-dir "$SALIENCY_DIR" \
+    --init-row-batch $INIT_ROW_BATCH --saliency-dir "$SALIENCY_DIR" \
     --output-dir "$dir" --verbose "$@" 2>&1 | tee "$clog"
   local rc=${PIPESTATUS[0]}
   set -e
@@ -195,12 +203,18 @@ cell_gq () {
   finish_cell "$tag" "$dir" "$clog" "$method"
 }
 
+# cell_gq <tag> <method-label> [extra driver args...]
+#   tag           directory + summary row name
+#   method-label  cosmetic, second column of the TSV
+#   extra args    the part that actually changes behaviour -- here --nosal,
+#                 which switches the Hessian to unweighted E[x x^T] and drops
+#                 the wgrad init weighting.
 cell_E
 # --nosal needs no saliency at all, so it must not read (or write) the shared
 # cache -- the cached tensors are shaped by --num-groups and are irrelevant here.
 SALIENCY_DIR_SAVED="$SALIENCY_DIR"
 SALIENCY_DIR=""
-cell_gq "N_nosal${BITS}"      "lnq-nosal"    --nosal
+cell_gq "N_nosal${BITS}"      "nosal"        --nosal
 SALIENCY_DIR="$SALIENCY_DIR_SAVED"
 cell_gq "G_guidedquant${BITS}" "guidedquant"
 

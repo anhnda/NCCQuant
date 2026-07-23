@@ -37,7 +37,26 @@ _DEBUG = os.environ.get("CB_DEBUG", "") == "1"
 
 
 class GuidedQuantQuantizer(BaseQuantizer):
-    """Full-row codebook quantizer, LNQ against per-group saliency Hessians."""
+    """Full-row codebook quantizer, LNQ against saliency-weighted Hessians.
+
+    Granularity is always FULL ROW: one codebook per output row, spanning every
+    input channel. There is no input-side blocking -- the Hessian couples all
+    input channels, so splitting them would discard the coupling the method
+    exists to exploit.
+
+    Three size parameters, and only one of them is an algorithm choice:
+
+      init_row_batch    output rows per k-means init batch. Pure memory knob;
+                        any value gives identical results.
+      solve_row_batch   output rows per update_C least-squares batch. Pure
+                        memory knob; any value gives identical results.
+      cd_block_size     column block in update_P. NOT a memory knob -- it sets
+                        the order in which the residual is propagated (inside
+                        a block, column by column; across blocks, once at the
+                        end), so changing it CHANGES THE ASSIGNMENTS. The
+                        reference hardcodes 128; leave it there unless you mean
+                        to deviate.
+    """
 
     def __init__(self, bits: int,
                  block_size: int | None = None,
@@ -45,7 +64,8 @@ class GuidedQuantQuantizer(BaseQuantizer):
                  iters: int = 3,
                  ridge: float = 1e-7,
                  cd_block_size: int = 128,
-                 row_block: int = 64,
+                 init_row_batch: int = 1024,
+                 solve_row_batch: int = 64,
                  init_iters: int = 50,
                  kmeans_init: str = "kmeans++",
                  seed: int = 0,
@@ -61,7 +81,8 @@ class GuidedQuantQuantizer(BaseQuantizer):
         self.iters = int(iters)
         self.ridge = float(ridge)
         self.cd_block_size = int(cd_block_size)
-        self.row_block = int(row_block)
+        self.solve_row_batch = int(solve_row_batch)
+        self.init_row_batch = int(init_row_batch)
         self.init_iters = int(init_iters)
         self.kmeans_init = kmeans_init
         self.seed = int(seed)
@@ -166,8 +187,8 @@ class GuidedQuantQuantizer(BaseQuantizer):
         device, dtype = W.device, W.dtype
         out = torch.empty(R, K, device=device, dtype=dtype)
         sl = torch.sqrt(torch.tensor(self.ridge, dtype=dtype, device=device))
-        for st in range(0, R, self.row_block):
-            en = min(st + self.row_block, R)
+        for st in range(0, R, self.solve_row_batch):
+            en = min(st + self.solve_row_batch, R)
             P = torch.nn.functional.one_hot(labels[st:en].long(),
                                             num_classes=K).to(dtype)
             A = torch.einsum('bj,ijc->ibc', reduced_X, P)
@@ -186,7 +207,7 @@ class GuidedQuantQuantizer(BaseQuantizer):
 
     # ------------------------------------------------------------------ #
     @torch.no_grad()
-    def quantize(self, W: torch.Tensor, row_chunk: int = 1024) -> QuantResult:
+    def quantize(self, W: torch.Tensor) -> QuantResult:
         if self._H is None:
             raise RuntimeError(
                 "GuidedQuant needs the saliency-weighted Hessian. Run "
@@ -223,8 +244,8 @@ class GuidedQuantQuantizer(BaseQuantizer):
 
         C = torch.empty(out_features, K, device=device, dtype=dtype)
         labels = torch.empty(out_features, in_features, device=device, dtype=torch.long)
-        for r0 in range(0, out_features, row_chunk):
-            r1 = min(r0 + row_chunk, out_features)
+        for r0 in range(0, out_features, self.init_row_batch):
+            r1 = min(r0 + self.init_row_batch, out_features)
             Wb = Wf[r0:r1]
             # The published sample_weight: squared end-loss gradient PER WEIGHT.
             # Unlike diag(G) this varies by output row, which is the point.

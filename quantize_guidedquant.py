@@ -134,12 +134,20 @@ def main():
     p.add_argument("--cd-cycles", type=int, default=4,
                    help="coordinate-descent sweeps per update_P (reference: 4)")
     p.add_argument("--ridge", type=float, default=1e-7)
-    p.add_argument("--row-block", type=int, default=64)
-    p.add_argument("--cd-block", type=int, default=128)
+    p.add_argument("--solve-row-batch", type=int, default=64,
+                   help="output rows per update_C solve. Memory only; results "
+                        "are identical for any value.")
+    p.add_argument("--cd-block", type=int, default=128,
+                   help="column block in update_P. NOT a memory knob: it sets "
+                        "the residual propagation order, so changing it changes "
+                        "the assignments. Reference hardcodes 128.")
     p.add_argument("--kmeans-init", type=str, default="kmeans++",
                    choices=["kmeans++", "quantile"])
     p.add_argument("--init-iters", type=int, default=50)
-    p.add_argument("--row-chunk", type=int, default=1024)
+    p.add_argument("--init-row-batch", type=int, default=1024,
+                   help="output rows per k-means init batch. Memory only; "
+                        "results are identical for any value. Lower if the "
+                        "init OOMs on wide layers.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--saliency-dir", type=str, default=None,
                    help="cache dir for phase-1 artefacts; reused if present. "
@@ -214,7 +222,8 @@ def main():
     quantizer = GuidedQuantQuantizer(
         bits=args.bits, block_size=-1,
         cd_cycles=args.cd_cycles, iters=args.iters, ridge=args.ridge,
-        cd_block_size=args.cd_block, row_block=args.row_block,
+        cd_block_size=args.cd_block, solve_row_batch=args.solve_row_batch,
+        init_row_batch=args.init_row_batch,
         init_iters=args.init_iters, kmeans_init=args.kmeans_init,
         seed=args.seed, verbose=args.verbose,
     )
@@ -248,7 +257,7 @@ def main():
             W = m.weight.data
             quantizer.set_hessian(col.get(name, device=device))
             quantizer.set_wgrad(wgrad[li].get(name) if wgrad[li] else None)
-            res = quantizer.quantize(W.to(device), row_chunk=args.row_chunk)
+            res = quantizer.quantize(W.to(device))
             m.weight.data = res.W_dequant.to(W.dtype).to(W.device)
             quantizer.set_hessian(None)
             quantizer.set_wgrad(None)
