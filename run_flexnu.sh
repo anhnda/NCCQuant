@@ -56,7 +56,7 @@ KEEP_CKPT=${KEEP_CKPT:-}          # ""=none, 1=all, or space-separated cell name
 # different seqlen are NOT comparable, so it is recorded in every json and in
 # the summary header.
 SEQLEN=${SEQLEN:-2048}
-EVAL_DATASETS=${EVAL_DATASETS:-"wikitext2"}   # e.g. "wikitext2 c4 ptb-new"
+EVAL_DATASETS=${EVAL_DATASETS:-"wikitext2 c4"}   # e.g. "wikitext2 c4 ptb-new"
 EVAL_METHOD=${EVAL_METHOD:-block}             # block = paper standard
 EVAL_STRIDE=${EVAL_STRIDE:-512}               # only used when method=sliding
 EVAL_DTYPE=${EVAL_DTYPE:-fp16}
