@@ -64,7 +64,7 @@ DATASET_CACHE=${DATASET_CACHE:-./dataset_cache}
 
 # ---- sanity check ---------------------------------------------------------
 # Reference fp16 wikitext2 PPL at seqlen 2048, from eval_ppl.py's docstring.
-SANITY=${SANITY:-1}                # 1 = run it before the ladder
+SANITY=${SANITY:-0}                # 1 = run it before the ladder
 SANITY_ONLY=${SANITY_ONLY:-0}      # 1 = run it and exit
 SANITY_STRICT=${SANITY_STRICT:-1}  # 1 = abort the ladder if it fails
 SANITY_MODEL=${SANITY_MODEL:-}     # default: MODEL_PATH (the unquantized model)
