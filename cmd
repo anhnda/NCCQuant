@@ -1,4 +1,4 @@
-MODEL_PATH=/home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Llama-2-7b-hf/snapshots/01c7f73d771dfac7d292323805ebc428287df4f9 \
+KEEP_CKPT=D_joint MODEL_PATH=/home/DATA/prometheus/anh/.cache/huggingface/hub/models--meta-llama--Llama-2-7b-hf/snapshots/01c7f73d771dfac7d292323805ebc428287df4f9 \
 bash run_flexnu.sh 
 python quantize.py --model-path ./models/Mistral-7B-v0.3 --quantizer nf4
 python quantize.py --model-path ./models/Mistral-7B-v0.3 --quantizer nvfp4 --budget-p 0.03
