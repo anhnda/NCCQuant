@@ -32,6 +32,7 @@ from .nvfp4 import NVFP4Quantizer
 from .learned_codebook import LearnedCodebookQuantizer
 from .flexnu import FlexNuQuantizer
 from .lnq import LNQQuantizer
+from .guidedquant import GuidedQuantQuantizer
 from .gram_collect import GramCollector, collect_grams
 from .ncc import apply_ncc, NCCStats, james_stein_mean
 from .bc import apply_bias_correction, compute_bias_correction, BCStats
@@ -89,8 +90,8 @@ def _lnq(bits):
         return LNQQuantizer(
             bits=bits,
             block_size=kw.get("cb_block_size", None),
-            cd_cycles=kw.get("lnq_cd_cycles", 2),
-            iters=kw.get("lnq_iters", 15),
+            cd_cycles=kw.get("lnq_cd_cycles", 4),
+            iters=kw.get("lnq_iters", 3),
             damp=kw.get("lnq_damp", 1e-2),
             ridge=kw.get("lnq_ridge", 1e-7),
             cd_block_size=kw.get("lnq_cd_block", 128),
@@ -133,7 +134,7 @@ def get_quantizer(name: str, **kwargs) -> BaseQuantizer:
 __all__ = [
     "BaseQuantizer", "QuantResult",
     "NormalFloatQuantizer", "NVFP4Quantizer", "LearnedCodebookQuantizer",
-    "FlexNuQuantizer", "LNQQuantizer", "GramCollector", "collect_grams", "NEEDS_GRAM",
+    "FlexNuQuantizer", "LNQQuantizer", "GuidedQuantQuantizer", "GramCollector", "collect_grams", "NEEDS_GRAM",
     "apply_ncc", "NCCStats", "james_stein_mean",
     "apply_bias_correction", "compute_bias_correction", "BCStats",
     "get_quantizer", "QUANTIZER_REGISTRY",
