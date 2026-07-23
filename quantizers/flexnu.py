@@ -459,12 +459,16 @@ class FlexNuQuantizer(BaseQuantizer):
             return (Res @ G * Res).sum()
 
         # ---- baseline energy: hard nearest-codeword on the init codebook ----
+        # At full-row granularity bs == in_features, so the [R, nb, bs, K]
+        # distance tensor is enormous (128 x 11008 x 16 x 4B ~= 90 GB). The
+        # codebook is sorted by construction, so searchsorted gives the same
+        # argmin in O(log K) with no [.., K] intermediate at all.
         with torch.no_grad():
-            d0 = (Wb.unsqueeze(-1) - cb0.unsqueeze(2)).abs()     # [R, nb, bs, K]
-            idx0 = d0.argmin(dim=-1)                             # [R, nb, bs]
-            del d0
-            W0 = torch.gather(cb0.unsqueeze(2).expand(R, nb, bs, K), 3,
-                              idx0.unsqueeze(-1)).squeeze(-1)
+            idx0 = torch.searchsorted(
+                (0.5 * (cb0[..., 1:] + cb0[..., :-1])).reshape(R * nb, K - 1).contiguous(),
+                Wb.reshape(R * nb, bs).contiguous(),
+            ).reshape(R, nb, bs).clamp_(0, K - 1)
+            W0 = torch.gather(cb0, 2, idx0)
             e_init = float(energy(W0).item())
             del W0, idx0
 

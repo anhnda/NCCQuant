@@ -39,37 +39,90 @@ class LearnedCodebookQuantizer(BaseQuantizer):
 
     @torch.no_grad()
     def _kmeans_blocks(self, Wb: torch.Tensor) -> torch.Tensor:
-        """Vectorised 1-D Lloyd k-means over a stack of blocks.
+        """1-D k-means over a stack of blocks, via sorted data + prefix sums.
 
         Wb : [G, bw]  (G = rows-in-chunk * n_blocks flattened, bw = block width)
         returns centers [G, K] sorted ascending, strictly increasing.
+
+        Works at any bw, including full-row (bw = in_features). Peak memory is
+        O(G * bw) for the sort plus one fp64 prefix-sum buffer, so at full row
+        `row_chunk` is the knob to turn down if memory is tight.
         """
         G, bw = Wb.shape
         K = self.num_levels
         device = Wb.device
 
-        qs = torch.linspace(0.0, 1.0, K, device=device, dtype=torch.float32)
-        centers = torch.quantile(Wb, qs, dim=1).t().contiguous()   # [G, K]
-        zc = centers.abs().argmin(dim=1)
-        centers[torch.arange(G, device=device), zc] = 0.0
-        centers, _ = torch.sort(centers, dim=1)
+        # 1-D k-means on the SORTED row via prefix sums (SqueezeLLM-style).
+        #
+        # The old quantile seed + Lloyd is fine at bw=64 but collapses at
+        # full-row width: an LLM weight row is a spike at 0 with rare outliers,
+        # so every interior quantile lands inside the spike, the K levels land
+        # on top of each other, and Lloyd cannot recover (collapsed centers own
+        # no distinct mass). The row then dequantizes to ~0 -- finite weights,
+        # no error, no OOM, NaN perplexity.
+        #
+        # In 1-D a cluster is always a contiguous run of sorted data, so the
+        # problem is just where to cut; cluster means come from prefix sums in
+        # O(1) and there is no seed to get stuck in.
+        sorted_X, _ = torch.sort(Wb, dim=1)                        # [G, bw]
+        # psum[:, i] = sum of first i sorted elements (psum[:, 0] = 0). fp64:
+        # a full row is ~1e4 terms and the means come out of differences of
+        # large partial sums, which fp32 cancels badly.
+        psum = torch.zeros(G, bw + 1, device=device, dtype=torch.float64)
+        psum[:, 1:] = torch.cumsum(sorted_X.double(), dim=1)
 
+        def _centroids(lo, hi):
+            """Mean of sorted_X[:, lo:hi) from prefix sums. lo,hi: [G,K] long.
+
+            Borders are non-decreasing, so these means come out ascending
+            already; empty clusters are the only exception and are patched
+            below.
+            """
+            n = (hi - lo).clamp(min=1).double()
+            s = torch.gather(psum, 1, hi) - torch.gather(psum, 1, lo)
+            mean = (s / n).float()
+            empty = (hi - lo) <= 0
+            if bool(empty.any()):
+                # An empty cluster has no mass; park it on the data point at its
+                # own border so it stays in order and stays a valid level.
+                fallback = torch.gather(sorted_X, 1, lo.clamp(max=bw - 1))
+                mean = torch.where(empty, fallback, mean)
+            return mean
+
+        # ---- init borders by equal MASS, then refine ------------------------
+        # Equal-mass (rank) cuts are the right starting point on a sorted array:
+        # unlike equal-value cuts they can never produce an empty cluster.
+        borders = torch.linspace(0, bw, K + 1, device=device)
+        borders = borders.round().long().view(1, K + 1).expand(G, K + 1).contiguous()
+
+        # Lloyd on the sorted array: recompute centroids, then recut at the
+        # midpoints. Each recut is a searchsorted, so this is O(K log bw).
         for _ in range(self.n_iters):
-            d = (Wb.unsqueeze(-1) - centers.unsqueeze(1)).abs()    # [G, bw, K]
-            assign = d.argmin(dim=-1)                              # [G, bw]
-            del d
-            new_centers = centers.clone()
-            for k in range(K):
-                mask = (assign == k)
-                cnt = mask.sum(dim=1).clamp(min=1)
-                summ = (Wb * mask).sum(dim=1)
-                mean_k = summ / cnt
-                owns = mask.any(dim=1)
-                new_centers[:, k] = torch.where(owns, mean_k, centers[:, k])
-            centers, _ = torch.sort(new_centers, dim=1)
+            centers = _centroids(borders[:, :-1], borders[:, 1:])  # [G, K]
 
-        # Strictly increasing (NCC neighbour reads require it).
-        eps = 1e-7
+            mid = 0.5 * (centers[:, 1:] + centers[:, :-1])         # [G, K-1]
+            # New borders = rank of each midpoint in the sorted row.
+            inner = torch.searchsorted(sorted_X.contiguous(), mid.contiguous())
+            new_borders = torch.empty_like(borders)
+            new_borders[:, 0] = 0
+            new_borders[:, -1] = bw
+            new_borders[:, 1:-1] = inner
+            # Keep borders non-decreasing and in range.
+            new_borders = new_borders.clamp(0, bw)
+            new_borders, _ = torch.cummax(new_borders, dim=1)
+            new_borders[:, -1] = bw
+            if torch.equal(new_borders, borders):
+                break
+            borders = new_borders
+
+        centers = _centroids(borders[:, :-1], borders[:, 1:])
+
+        # Strictly increasing (NCC neighbour reads require it). Scaled to the
+        # row's own span: a fixed 1e-7 sits below fp16 resolution for typical
+        # weight magnitudes, so collapsed levels would survive the fp16 cast as
+        # exact duplicates.
+        span = (sorted_X[:, -1] - sorted_X[:, 0]).clamp(min=1e-12)  # [G]
+        eps = (span * 1e-4).clamp(min=1e-7)
         for k in range(1, K):
             bad = centers[:, k] <= centers[:, k - 1]
             centers[:, k] = torch.where(bad, centers[:, k - 1] + eps, centers[:, k])
@@ -101,12 +154,16 @@ class LearnedCodebookQuantizer(BaseQuantizer):
                 block_codebooks[r0:r1, b, :] = centers
                 block_scales[r0:r1, b] = Wb.abs().amax(dim=1)
 
-                diff = (Wb.unsqueeze(-1) - centers.unsqueeze(1)).abs()  # [rc, bw, K]
-                idx = diff.argmin(dim=-1)
+                # centers is strictly increasing, so nearest-codeword is a
+                # searchsorted against the midpoints: same result as the
+                # [rc, bw, K] argmin, O(log K), no large intermediate.
+                mid = 0.5 * (centers[:, 1:] + centers[:, :-1])   # [rc, K-1]
+                idx = torch.searchsorted(
+                    mid.contiguous(), Wb.contiguous()
+                ).clamp_(0, K - 1)                               # [rc, bw]
                 deq = torch.gather(centers, 1, idx)
                 W_dequant[r0:r1, c0:c1] = deq.to(W.dtype)
                 indices[r0:r1, c0:c1] = idx
-                del diff
 
         return QuantResult(
             W_dequant=W_dequant,
