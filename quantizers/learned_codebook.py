@@ -22,20 +22,35 @@ class LearnedCodebookQuantizer(BaseQuantizer):
     """Per-(row, block) learned scalar codebook via 1-D k-means."""
 
     def __init__(self, bits: int, block_size: int | None = None,
-                 n_iters: int = 20, seed: int = 0):
+                 n_iters: int = 20, seed: int = 0, init: str = "kmeans++"):
         if bits not in (3, 4):
             raise ValueError(f"LearnedCodebook supports bits in {{3,4}}, got {bits}")
+        if init not in ("kmeans++", "quantile", "rank"):
+            raise ValueError(
+                f"init must be one of 'kmeans++', 'quantile', 'rank'; got {init!r}"
+            )
         super().__init__(bits=bits, block_size=block_size)
         self.name = f"codebook{bits}"
         self.num_levels = 2 ** bits
         self.n_iters = n_iters
         self.seed = seed
+        # 'kmeans++' : D2 sampling, ported from flash1dkmeans (unweighted).
+        # 'quantile' : equal-VALUE cuts, interpolated off the sorted row. This is
+        #              the torch.quantile seed, minus the ~16M element cap --
+        #              sorted_X already exists, so a quantile is an index lookup.
+        # 'rank'     : equal-COUNT cuts. Cannot produce an empty cluster.
+        self.init = init
 
     @property
     def q_levels(self) -> torch.Tensor:
         # No canonical shape for a learned codebook; expose a placeholder grid so
         # callers that only need L work. Realised levels live in block_codebooks.
         return torch.linspace(-1.0, 1.0, self.num_levels)
+
+    def __repr__(self) -> str:
+        bs_str = "full_row" if self.full_row else str(self.block_size)
+        return (f"{self.__class__.__name__}(name={self.name!r}, bits={self.bits}, "
+                f"block_size={bs_str}, init={self.init!r})")
 
     @torch.no_grad()
     def _kmeans_blocks(self, Wb: torch.Tensor) -> torch.Tensor:
@@ -169,48 +184,79 @@ class LearnedCodebookQuantizer(BaseQuantizer):
             owner = torch.gather(sc, 1, owner_idx.clamp(max=k - 1))
             return (sorted_X - owner) ** 2
 
-        gen = torch.Generator(device=device if device.type != "mps" else "cpu")
-        gen.manual_seed(self.seed)
+        if self.init == "rank":
+            # Equal-COUNT cuts straight into border space. No values needed.
+            borders = (torch.linspace(0, 1, K + 1, device=device) * bw)
+            borders = borders.round().long().clamp(0, bw)
+            borders = borders.view(1, K + 1).expand(G, K + 1).contiguous()
 
-        def _rand_unit(*shape):
-            return torch.rand(*shape, device=device, generator=gen)
+        elif self.init == "quantile":
+            # Equal-VALUE cuts: the torch.quantile seed without the size cap.
+            #
+            # torch.quantile refuses inputs past ~16M elements in the reduced
+            # dim because it sorts internally. sorted_X is ALREADY sorted, so a
+            # quantile here is a fractional index lookup -- exact, O(K), and
+            # unbounded in size. This reproduces interpolation='linear'.
+            q = (torch.arange(K, device=device, dtype=torch.float32) + 0.5) / K
+            pos = q * (bw - 1)                                      # [K]
+            lo_i = pos.floor().long().clamp(0, bw - 1)
+            hi_i = pos.ceil().long().clamp(0, bw - 1)
+            frac = (pos - lo_i.to(pos.dtype)).to(sorted_X.dtype)    # [K]
+            lo_v = sorted_X[:, lo_i]                                # [G, K]
+            hi_v = sorted_X[:, hi_i]
+            centers_q = lo_v + (hi_v - lo_v) * frac.view(1, -1)
+            # NOTE equal-value cuts CAN produce empty clusters on a spiky row --
+            # that is inherent to the seed, not a bug here. _centroids patches
+            # empties and keeps the ladder ascending, so Lloyd can still move.
+            centers_q, _ = torch.sort(centers_q, dim=1)
+            borders = _borders_from_centers(centers_q)
+            borders, _ = torch.cummax(borders, dim=1)
+            borders[:, -1] = bw
 
-        centers_pp = torch.empty(G, K, device=device, dtype=sorted_X.dtype)
-        # First center: uniform over the row's points, independently per row.
-        first = (_rand_unit(G, 1) * bw).long().clamp_(0, bw - 1)
-        centers_pp[:, :1] = torch.gather(sorted_X, 1, first)
+        else:
+            gen = torch.Generator(device=device if device.type != "mps" else "cpu")
+            gen.manual_seed(self.seed)
 
-        n_local_trials = 2 + int(torch.log(torch.tensor(float(K))).item())
+            def _rand_unit(*shape):
+                return torch.rand(*shape, device=device, generator=gen)
 
-        for c_id in range(1, K):
-            # D2 sampling: draw candidates with P(x) proportional to its squared
-            # distance to the nearest chosen center.
-            d2 = _closest_sq_dist(centers_pp[:, :c_id]).double()
-            cw = torch.cumsum(d2, dim=1)                            # [G, bw]
-            total = cw[:, -1:].clamp(min=1e-30)
-            sel = _rand_unit(G, n_local_trials).double() * total    # [G, L]
-            cand_idx = torch.searchsorted(cw.contiguous(), sel.contiguous())
-            cand_idx = cand_idx.clamp_(0, bw - 1)
-            cand = torch.gather(sorted_X, 1, cand_idx)              # [G, L]
+            centers_pp = torch.empty(G, K, device=device, dtype=sorted_X.dtype)
+            # First center: uniform over the row's points, independently per row.
+            first = (_rand_unit(G, 1) * bw).long().clamp_(0, bw - 1)
+            centers_pp[:, :1] = torch.gather(sorted_X, 1, first)
 
-            # Score each candidate by the TOTAL inertia it would produce, and
-            # keep the best -- the "greedy k-means++" local-trials step.
-            best_inertia = torch.full((G,), float("inf"), device=device, dtype=torch.float64)
-            best_cand = cand[:, 0].clone()
-            for t in range(n_local_trials):
-                trial = torch.cat([centers_pp[:, :c_id], cand[:, t:t + 1]], dim=1)
-                trial, _ = torch.sort(trial, dim=1)
-                b_t = _borders_from_centers(trial)
-                inertia = _inertia_per_cluster(trial, b_t)[:, :c_id + 1].sum(dim=1)
-                better = inertia < best_inertia
-                best_inertia = torch.where(better, inertia, best_inertia)
-                best_cand = torch.where(better, cand[:, t], best_cand)
-            centers_pp[:, c_id] = best_cand
+            n_local_trials = 2 + int(torch.log(torch.tensor(float(K))).item())
 
-        centers_pp, _ = torch.sort(centers_pp, dim=1)
-        borders = _borders_from_centers(centers_pp)
-        borders, _ = torch.cummax(borders, dim=1)
-        borders[:, -1] = bw
+            for c_id in range(1, K):
+                # D2 sampling: draw candidates with P(x) proportional to its
+                # squared distance to the nearest chosen center.
+                d2 = _closest_sq_dist(centers_pp[:, :c_id]).double()
+                cw = torch.cumsum(d2, dim=1)                            # [G, bw]
+                total = cw[:, -1:].clamp(min=1e-30)
+                sel = _rand_unit(G, n_local_trials).double() * total    # [G, L]
+                cand_idx = torch.searchsorted(cw.contiguous(), sel.contiguous())
+                cand_idx = cand_idx.clamp_(0, bw - 1)
+                cand = torch.gather(sorted_X, 1, cand_idx)              # [G, L]
+
+                # Score each candidate by the TOTAL inertia it would produce,
+                # and keep the best -- the "greedy k-means++" local-trials step.
+                best_inertia = torch.full((G,), float("inf"), device=device,
+                                          dtype=torch.float64)
+                best_cand = cand[:, 0].clone()
+                for t in range(n_local_trials):
+                    trial = torch.cat([centers_pp[:, :c_id], cand[:, t:t + 1]], dim=1)
+                    trial, _ = torch.sort(trial, dim=1)
+                    b_t = _borders_from_centers(trial)
+                    inertia = _inertia_per_cluster(trial, b_t).sum(dim=1)
+                    better = inertia < best_inertia
+                    best_inertia = torch.where(better, inertia, best_inertia)
+                    best_cand = torch.where(better, cand[:, t], best_cand)
+                centers_pp[:, c_id] = best_cand
+
+            centers_pp, _ = torch.sort(centers_pp, dim=1)
+            borders = _borders_from_centers(centers_pp)
+            borders, _ = torch.cummax(borders, dim=1)
+            borders[:, -1] = bw
 
         # Lloyd on the sorted array: recompute centroids, then recut at the
         # midpoints. Each recut is a searchsorted, so this is O(K log bw).
