@@ -41,6 +41,19 @@ OUT_ROOT=${OUT_ROOT:-./quantized_models/gq}
 LOG_DIR=${LOG_DIR:-./logs}
 KEEP_CKPT=${KEEP_CKPT:-}          # ""=none, 1=all, or space-separated cells
 
+# ---- model path resolution ------------------------------------------------
+# MODEL_PATH may be a local dir, a full repo id (meta-llama/Llama-3.2-1B), or a
+# bare name (Llama-3.2-1B) that is matched against the local HF cache. Keep the
+# SHORT name for logs and cache keys: the resolved snapshot path ends in a
+# commit hash that changes on every re-pull, which would silently invalidate
+# derived cache directories.
+MODEL_NAME=$(basename "$MODEL_PATH")
+case "$MODEL_PATH" in
+  */snapshots/*) MODEL_NAME=$(echo "$MODEL_PATH" | sed -E 's#.*/models--([^/]+)/snapshots/.*#\1#; s#^.*--##') ;;
+esac
+MODEL_PATH=$(python resolve_model.py "$MODEL_PATH")
+
+
 BITS=${BITS:-3}
 NUM_GROUPS=${NUM_GROUPS:-1}
 N_CALIB=${N_CALIB:-128}
@@ -70,7 +83,7 @@ INIT_ITERS=${INIT_ITERS:-50}
 
 # Phase-1 artefacts are expensive and model-specific, not cell-specific:
 # compute once, reuse across cells.
-SALIENCY_DIR=${SALIENCY_DIR:-./cache/saliency_$(basename "$MODEL_PATH")_g${NUM_GROUPS}_s${N_CALIB}_l${CALIB_LEN}_${CALIB_DATASET}}
+SALIENCY_DIR=${SALIENCY_DIR:-./cache/saliency_${MODEL_NAME}_g${NUM_GROUPS}_s${N_CALIB}_l${CALIB_LEN}_${CALIB_DATASET}}
 
 SEQLEN=${SEQLEN:-2048}
 EVAL_DATASETS=${EVAL_DATASETS:-"wikitext2 c4"}
@@ -88,7 +101,8 @@ LOG_FILE="$LOG_DIR/gq_$TS.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "=== run started $(date) ==="
-echo "model:     $MODEL_PATH"
+echo "model:     $MODEL_NAME"
+echo "resolved:  $MODEL_PATH"
 echo "bits:      $BITS   groups: $NUM_GROUPS   full row"
 echo "calib:     $N_CALIB x $CALIB_LEN ($CALIB_DATASET)"
 echo "lnq:       iters=$ITERS cd_cycles=$CD_CYCLES ridge=$RIDGE"
@@ -101,7 +115,7 @@ EVAL_COMMON="--datasets $EVAL_DATASETS --seqlen $SEQLEN --method $EVAL_METHOD \
   --dtype $EVAL_DTYPE --cache-dir $DATASET_CACHE"
 
 {
-  echo "# model=$MODEL_PATH bits=$BITS block=full_row groups=$NUM_GROUPS"
+  echo "# model=$MODEL_NAME bits=$BITS block=full_row groups=$NUM_GROUPS"
   echo "# calib: $N_CALIB x $CALIB_LEN ($CALIB_DATASET)"
   echo "# lnq: iters=$ITERS cd_cycles=$CD_CYCLES ridge=$RIDGE"
   echo "# eval: method=$EVAL_METHOD seqlen=$SEQLEN dtype=$EVAL_DTYPE"

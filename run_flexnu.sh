@@ -51,6 +51,19 @@ OUT_ROOT=${OUT_ROOT:-./quantized_models/flexnu}
 LOG_DIR=${LOG_DIR:-./logs}
 KEEP_CKPT=${KEEP_CKPT:-}          # ""=none, 1=all, or space-separated cell names
 
+# ---- model path resolution ------------------------------------------------
+# MODEL_PATH may be a local dir, a full repo id (meta-llama/Llama-3.2-1B), or a
+# bare name (Llama-3.2-1B) that is matched against the local HF cache. Keep the
+# SHORT name for logs and cache keys: the resolved snapshot path ends in a
+# commit hash that changes on every re-pull, which would silently invalidate
+# derived cache directories.
+MODEL_NAME=$(basename "$MODEL_PATH")
+case "$MODEL_PATH" in
+  */snapshots/*) MODEL_NAME=$(echo "$MODEL_PATH" | sed -E 's#.*/models--([^/]+)/snapshots/.*#\1#; s#^.*--##') ;;
+esac
+MODEL_PATH=$(python resolve_model.py "$MODEL_PATH")
+
+
 # ---- eval protocol --------------------------------------------------------
 # seqlen 2048 for Llama-1/2 and Mistral; 8192 for Llama-3 / Qwen3. Numbers at
 # different seqlen are NOT comparable, so it is recorded in every json and in
@@ -81,7 +94,8 @@ LOG_FILE="$LOG_DIR/flexnu_$TS.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "=== run started $(date) ==="
-echo "model:    $MODEL_PATH"
+echo "model:    $MODEL_NAME"
+echo "resolved: $MODEL_PATH"
 echo "eval:     method=$EVAL_METHOD seqlen=$SEQLEN dtype=$EVAL_DTYPE "\
 "datasets='$EVAL_DATASETS'"
 [ "$EVAL_METHOD" = "sliding" ] && echo "          stride=$EVAL_STRIDE  "\
@@ -209,7 +223,7 @@ fi
 # comparable and a bare table of numbers loses that.
 {
   if [ "$CB_BLOCK" -le 0 ]; then CB_BLOCK_STR="full_row"; else CB_BLOCK_STR="$CB_BLOCK"; fi
-  echo "# model=$MODEL_PATH bits=$BITS block=$CB_BLOCK_STR"
+  echo "# model=$MODEL_NAME bits=$BITS block=$CB_BLOCK_STR"
   echo "# calib: $N_CALIB x $CALIB_LEN ($CALIB_DATASET)"
   if [ "$EVAL_METHOD" = "sliding" ]; then
     echo "# eval: method=sliding seqlen=$SEQLEN stride=$EVAL_STRIDE dtype=$EVAL_DTYPE"
