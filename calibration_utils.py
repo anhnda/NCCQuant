@@ -2,7 +2,8 @@
 Calibration Data Loading Utilities for AWQ Quantization.
 
 Provides standard calibration data loaders for:
-- C4 dataset (recommended for cross-dataset robustness)
+- C4 dataset (default; recommended for cross-dataset robustness)
+- RedPajama dataset (option; diverse multi-source web/code/books mix)
 - WikiText-2 dataset (lightweight alternative)
 
 Key Feature: Random slicing within documents (standard GPTQ/AWQ practice)
@@ -228,29 +229,159 @@ def get_wikitext2_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=4
     return calibration_texts
 
 
-def load_calibration_data(dataset_name, tokenizer, n_samples=128, seqlen=2048, seed=42, cache_dir="./calibration_cache"):
+def get_redpajama_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=42,
+                                   return_tensors=False, cache_dir="./calibration_cache",
+                                   subset="default"):
+    """
+    Load RedPajama calibration data with random slicing.
+
+    Uses togethercomputer/RedPajama-Data-1T-Sample, a 1B-token sample of the
+    RedPajama corpus (CommonCrawl, C4, GitHub, Books, ArXiv, Wikipedia,
+    StackExchange). More source-diverse than C4 alone, which makes it a useful
+    alternative when you want calibration statistics that are not dominated by
+    a single web crawl.
+
+    Same random-slicing procedure as the C4 loader:
+    1. Stream the dataset
+    2. Fast-skip documents that are obviously too short (char heuristic)
+    3. Tokenize, skip if < seqlen tokens
+    4. Randomly slice a window of length seqlen
+
+    Args:
+        tokenizer: HuggingFace tokenizer
+        n_samples: Number of calibration samples (default: 128)
+        seqlen: Sequence length in tokens (default: 2048)
+        seed: Random seed for reproducibility
+        return_tensors: If True, return token tensors. If False, return text strings
+        cache_dir: Directory to cache downloaded data (default: "./calibration_cache")
+        subset: RedPajama sample config name (default: "default")
+
+    Returns:
+        List[torch.Tensor] if return_tensors=True, else List[str]
+    """
+    print(f"\n[RedPajama Calibration Data]")
+    print(f"  Samples: {n_samples}")
+    print(f"  Sequence length: {seqlen} tokens")
+    print(f"  Method: Random slicing with fast filtering")
+    print(f"  Seed: {seed}")
+
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(exist_ok=True)
+
+    cache_file = cache_path / (
+        f"redpajama_calib_n{n_samples}_len{seqlen}_seed{seed}_tensors{return_tensors}.pkl"
+    )
+    if cache_file.exists():
+        print(f"\n  📦 Loading from cache: {cache_file}")
+        with open(cache_file, 'rb') as f:
+            return pickle.load(f)
+
+    print(f"\n  ⚠️  No cache found, downloading from RedPajama...")
+    random.seed(seed)
+
+    traindata = load_dataset(
+        "togethercomputer/RedPajama-Data-1T-Sample",
+        subset,
+        split="train",
+        streaming=True,
+        trust_remote_code=True,
+    )
+
+    dataset = []
+    skipped = 0
+    char_threshold = seqlen * 3
+
+    print(f"\n  Streaming RedPajama with fast filtering...")
+
+    for i, data in enumerate(traindata):
+        text = data.get('text', '')
+
+        if len(text) < char_threshold:
+            skipped += 1
+            continue
+
+        trainenc = tokenizer(text, return_tensors='pt')
+
+        if trainenc.input_ids.shape[1] < seqlen:
+            skipped += 1
+            continue
+
+        max_start = trainenc.input_ids.shape[1] - seqlen
+        start_idx = random.randint(0, max_start)
+        end_idx = start_idx + seqlen
+
+        inp = trainenc.input_ids[:, start_idx:end_idx]
+
+        if return_tensors:
+            dataset.append(inp)
+        else:
+            dataset.append(tokenizer.decode(inp[0], skip_special_tokens=True))
+
+        if (len(dataset) + 1) % 32 == 0:
+            print(f"    Collected {len(dataset)}/{n_samples} samples "
+                  f"(skipped {skipped} short docs)...")
+
+        if len(dataset) == n_samples:
+            break
+
+    print(f"\n  ✓ Collected {len(dataset)} samples from RedPajama")
+    print(f"  ✓ Skipped {skipped} documents (too short)")
+
+    print(f"  💾 Saving to cache: {cache_file}")
+    with open(cache_file, 'wb') as f:
+        pickle.dump(dataset, f)
+
+    return dataset
+
+
+CALIBRATION_DATASETS = ("c4", "redpajama", "wikitext2")
+DEFAULT_CALIBRATION_DATASET = "c4"
+
+
+def load_calibration_data(dataset_name=DEFAULT_CALIBRATION_DATASET, tokenizer=None,
+                          n_samples=128, seqlen=2048, seed=42,
+                          cache_dir="./calibration_cache", return_tensors=False):
     """
     Universal calibration data loader.
 
     Args:
-        dataset_name: 'c4', 'wikitext2', or 'wikitext'
+        dataset_name: 'c4' (default), 'redpajama', or 'wikitext2'/'wikitext'
         tokenizer: HuggingFace tokenizer
         n_samples: Number of calibration samples
         seqlen: Sequence length in tokens
         seed: Random seed
         cache_dir: Directory to cache downloaded data (default: "./calibration_cache")
+        return_tensors: If True, return token tensors instead of decoded text.
+                        (WikiText-2 always returns text.)
 
     Returns:
-        List[str]: Calibration texts
+        List[str] (or List[torch.Tensor] when return_tensors=True)
     """
-    dataset_name = dataset_name.lower()
+    if tokenizer is None:
+        raise ValueError("load_calibration_data requires a tokenizer")
+
+    dataset_name = (dataset_name or DEFAULT_CALIBRATION_DATASET).lower()
 
     if dataset_name == 'c4':
-        return get_c4_calibration_data(tokenizer, n_samples, seqlen, seed, cache_dir=cache_dir)
-    elif dataset_name in ['wikitext2', 'wikitext']:
-        return get_wikitext2_calibration_data(tokenizer, n_samples, seqlen, seed, split='train', cache_dir=cache_dir)
+        return get_c4_calibration_data(tokenizer, n_samples, seqlen, seed,
+                                       return_tensors=return_tensors,
+                                       cache_dir=cache_dir)
+    elif dataset_name in ('redpajama', 'red_pajama', 'redpyjama', 'rp'):
+        return get_redpajama_calibration_data(tokenizer, n_samples, seqlen, seed,
+                                              return_tensors=return_tensors,
+                                              cache_dir=cache_dir)
+    elif dataset_name in ('wikitext2', 'wikitext'):
+        texts = get_wikitext2_calibration_data(tokenizer, n_samples, seqlen, seed,
+                                               split='train', cache_dir=cache_dir)
+        if return_tensors:
+            return [tokenizer(t, return_tensors='pt').input_ids[:, :seqlen]
+                    for t in texts]
+        return texts
     else:
-        raise ValueError(f"Unknown dataset: {dataset_name}. Use 'c4' or 'wikitext2'")
+        raise ValueError(
+            f"Unknown dataset: {dataset_name}. "
+            f"Choose one of {CALIBRATION_DATASETS}"
+        )
 
 
 # Example usage
@@ -283,5 +414,16 @@ if __name__ == "__main__":
     wt2_samples = get_wikitext2_calibration_data(tokenizer, n_samples=10, seqlen=512)
     print(f"WikiText-2 sample length: {len(wt2_samples[0])} chars")
     print(f"WikiText-2 sample preview: {wt2_samples[0][:200]}...")
+
+    # Test RedPajama
+    print("\n[Test 4: RedPajama]")
+    rp_samples = get_redpajama_calibration_data(tokenizer, n_samples=10, seqlen=512)
+    print(f"RedPajama sample length: {len(rp_samples[0])} chars")
+    print(f"RedPajama sample preview: {rp_samples[0][:200]}...")
+
+    # Test universal loader default (c4)
+    print("\n[Test 5: load_calibration_data default -> c4]")
+    default_samples = load_calibration_data(tokenizer=tokenizer, n_samples=4, seqlen=512)
+    print(f"Default loader returned {len(default_samples)} samples")
 
     print("\n✓ All tests passed!")

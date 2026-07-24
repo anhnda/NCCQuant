@@ -48,15 +48,32 @@ from quantizers import get_quantizer, apply_ncc, NEEDS_GRAM, QUANTIZER_REGISTRY
 from quantizers.gram_collect import GramCollector
 from quantizers import apply_bias_correction
 
+from calibration_utils import (
+    CALIBRATION_DATASETS,
+    DEFAULT_CALIBRATION_DATASET,
+    load_calibration_data,
+)
+
 
 # --------------------------------------------------------------------------- #
 # Calibration data
 # --------------------------------------------------------------------------- #
-def load_wikitext2_simple(n_samples: int = 128) -> List[str]:
-    from datasets import load_dataset
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-    texts = [it["text"] for it in ds if len(it["text"].strip()) > 0]
-    return texts[:n_samples]
+# All calibration loading goes through calibration_utils.load_calibration_data.
+# Default is C4 (random-slice windows, standard GPTQ/AWQ practice); 'redpajama'
+# and 'wikitext2' are the other options. Kept as a thin wrapper so the call site
+# below stays readable.
+def load_calib_texts(tokenizer, dataset: str = DEFAULT_CALIBRATION_DATASET,
+                     n_samples: int = 128, seqlen: int = 512,
+                     seed: int = 42,
+                     cache_dir: str = "./calibration_cache") -> List[str]:
+    return load_calibration_data(
+        dataset_name=dataset,
+        tokenizer=tokenizer,
+        n_samples=n_samples,
+        seqlen=seqlen,
+        seed=seed,
+        cache_dir=cache_dir,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -354,8 +371,11 @@ def main():
     p.add_argument("--budget-p", type=float, default=0.02, help="NCC budget fraction p")
     p.add_argument("--n-calib", type=int, default=128)
     p.add_argument("--max-length", type=int, default=512)
-    p.add_argument("--calib-dataset", type=str, default="wikitext2-simple",
-                   choices=["wikitext2-simple"])
+    p.add_argument("--calib-dataset", type=str, default=DEFAULT_CALIBRATION_DATASET,
+                   choices=list(CALIBRATION_DATASETS),
+                   help="Calibration corpus (default: c4)")
+    p.add_argument("--calib-cache-dir", type=str, default="./calibration_cache",
+                   help="Where calibration samples are cached")
     p.add_argument("--seed", type=int, default=42)
 
     # Symmetric vs asymmetric per-block mapping (global ASYM flag).
@@ -498,7 +518,14 @@ def main():
     )
     print(f"Loaded quantizer: {quantizer}")
 
-    calib_texts = load_wikitext2_simple(n_samples=args.n_calib)
+    calib_texts = load_calib_texts(
+        tokenizer,
+        dataset=args.calib_dataset,
+        n_samples=args.n_calib,
+        seqlen=args.max_length,
+        seed=args.seed,
+        cache_dir=args.calib_cache_dir,
+    )
 
     quantize_model(
         model, tokenizer, quantizer, calib_texts, device,

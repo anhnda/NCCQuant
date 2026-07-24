@@ -45,7 +45,10 @@ BITS=${BITS:-3}
 NUM_GROUPS=${NUM_GROUPS:-1}
 N_CALIB=${N_CALIB:-128}
 CALIB_LEN=${CALIB_LEN:-2048}
-CALIB_DATASET=${CALIB_DATASET:-wikitext2}
+# Calibration corpus. c4 is the default (random-slice windows, standard
+# GPTQ/AWQ practice). Other options: redpajama, wikitext2.
+CALIB_DATASET=${CALIB_DATASET:-c4}
+CALIB_CACHE=${CALIB_CACHE:-./calibration_cache}
 
 # LNQ hyper-params. Reference defaults are iters=3, cd_cycles=4.
 ITERS=${ITERS:-3}
@@ -67,7 +70,7 @@ INIT_ITERS=${INIT_ITERS:-50}
 
 # Phase-1 artefacts are expensive and model-specific, not cell-specific:
 # compute once, reuse across cells.
-SALIENCY_DIR=${SALIENCY_DIR:-./cache/saliency_$(basename "$MODEL_PATH")_g${NUM_GROUPS}_s${N_CALIB}_l${CALIB_LEN}}
+SALIENCY_DIR=${SALIENCY_DIR:-./cache/saliency_$(basename "$MODEL_PATH")_g${NUM_GROUPS}_s${N_CALIB}_l${CALIB_LEN}_${CALIB_DATASET}}
 
 SEQLEN=${SEQLEN:-2048}
 EVAL_DATASETS=${EVAL_DATASETS:-"wikitext2 c4"}
@@ -163,6 +166,7 @@ cell_E () {
   set +e
   python quantize.py --model-path "$MODEL_PATH" --quantizer "codebook${BITS}" \
     --cb-block-size -1 --n-calib $N_CALIB --max-length $CALIB_LEN \
+    --calib-dataset $CALIB_DATASET --calib-cache-dir $CALIB_CACHE \
     --no-ncc --output-dir "$dir" 2>&1 | tee "$clog"
   local rc=${PIPESTATUS[0]}
   set -e
@@ -188,6 +192,7 @@ cell_gq () {
   python quantize_guidedquant.py \
     --model-path "$MODEL_PATH" --bits $BITS --num-groups $NUM_GROUPS \
     --n-calib $N_CALIB --seq-len $CALIB_LEN --calib-dataset $CALIB_DATASET \
+    --calib-cache-dir $CALIB_CACHE \
     --iters $ITERS --cd-cycles $CD_CYCLES --ridge $RIDGE \
     --solve-row-batch $SOLVE_ROW_BATCH --cd-block $CD_BLOCK \
     --kmeans-init $KMEANS_INIT --init-iters $INIT_ITERS \

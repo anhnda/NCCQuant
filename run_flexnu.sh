@@ -97,6 +97,12 @@ BITS=${BITS:-3}
 CB_BLOCK=${CB_BLOCK:--1}
 N_CALIB=${N_CALIB:-128}
 CALIB_LEN=${CALIB_LEN:-512}     # calibration seqlen; unrelated to eval SEQLEN
+# Calibration corpus. c4 is the default (random-slice windows, standard
+# GPTQ/AWQ practice). Other options: redpajama, wikitext2.
+CALIB_DATASET=${CALIB_DATASET:-c4}
+CALIB_CACHE=${CALIB_CACHE:-./calibration_cache}
+
+echo "calib:    $N_CALIB x $CALIB_LEN ($CALIB_DATASET)"
 
 # ---- FlexNu hyper-params --------------------------------------------------
 ITERS=${ITERS:-400}
@@ -119,6 +125,7 @@ GRAM_GROUP=${GRAM_GROUP:-8}
 GRAM_DEV=${GRAM_DEV:-cpu}
 
 FLEX_COMMON="--cb-block-size $CB_BLOCK --n-calib $N_CALIB --max-length $CALIB_LEN \
+  --calib-dataset $CALIB_DATASET --calib-cache-dir $CALIB_CACHE \
   --no-ncc --flexnu-iters $ITERS --flexnu-lr-cb $LR_CB \
   --flexnu-lr-scale $LR_SCALE --flexnu-tau-frac $TAU_FRAC \
   --flexnu-stage-frac $STAGE_FRAC --flexnu-row-block $ROW_BLOCK \
@@ -191,6 +198,7 @@ fi
 {
   if [ "$CB_BLOCK" -le 0 ]; then CB_BLOCK_STR="full_row"; else CB_BLOCK_STR="$CB_BLOCK"; fi
   echo "# model=$MODEL_PATH bits=$BITS block=$CB_BLOCK_STR"
+  echo "# calib: $N_CALIB x $CALIB_LEN ($CALIB_DATASET)"
   if [ "$EVAL_METHOD" = "sliding" ]; then
     echo "# eval: method=sliding seqlen=$SEQLEN stride=$EVAL_STRIDE dtype=$EVAL_DTYPE"
   else
@@ -230,6 +238,7 @@ cell () {
     python quantize.py \
       --model-path "$MODEL_PATH" --quantizer "$quant" \
       --cb-block-size $CB_BLOCK --n-calib $N_CALIB --max-length $CALIB_LEN \
+      --calib-dataset $CALIB_DATASET --calib-cache-dir $CALIB_CACHE \
       --no-ncc --output-dir "$dir" "$@" 2>&1 | tee "$clog"
   else
     python quantize.py \

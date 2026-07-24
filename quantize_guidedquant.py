@@ -29,7 +29,7 @@ Llama-2-7B block (7 Linears) costs roughly 870 MB on top of the model. Raising
 
 USAGE
   python quantize_guidedquant.py --model-path <hf-path> --bits 3 \
-      --n-calib 128 --seq-len 2048 --output-dir out/
+      --n-calib 128 --seq-len 2048 --calib-dataset c4 --output-dir out/
 """
 
 from __future__ import annotations
@@ -50,38 +50,46 @@ from quantizers.guidedquant_collect import (
     _module_map,
 )
 
+from calibration_utils import (
+    CALIBRATION_DATASETS,
+    DEFAULT_CALIBRATION_DATASET,
+    load_calibration_data,
+)
+
 
 # --------------------------------------------------------------------------- #
 def load_calibration(tokenizer, n_samples: int, seq_len: int,
-                     dataset: str = "wikitext2") -> List[torch.Tensor]:
+                     dataset: str = DEFAULT_CALIBRATION_DATASET,
+                     seed: int = 42,
+                     cache_dir: str = "./calibration_cache") -> List[torch.Tensor]:
     """Fixed-length token sequences. Deterministic order -- phases 1 and 2
-    both iterate this list, and they must agree."""
-    from datasets import load_dataset
+    both iterate this list, and they must agree.
 
-    if dataset == "wikitext2":
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-        text = "\n\n".join(it["text"] for it in ds if it["text"].strip())
-    elif dataset == "c4":
-        ds = load_dataset("allenai/c4", "en",
-                          data_files={"train": "en/c4-train.00000-of-01024.json.gz"},
-                          split="train", streaming=True)
-        parts, n = [], 0
-        for it in ds:
-            parts.append(it["text"])
-            n += len(it["text"])
-            if n > n_samples * seq_len * 8:
-                break
-        text = "\n\n".join(parts)
-    else:
-        raise ValueError(f"unknown calibration dataset {dataset!r}")
+    Delegates to calibration_utils.load_calibration_data so c4 (default),
+    redpajama and wikitext2 all share one implementation, one cache, and one
+    random-slicing policy.
+    """
+    seqs = load_calibration_data(
+        dataset_name=dataset,
+        tokenizer=tokenizer,
+        n_samples=n_samples,
+        seqlen=seq_len,
+        seed=seed,
+        cache_dir=cache_dir,
+        return_tensors=True,
+    )
 
-    enc = tokenizer(text, return_tensors="pt").input_ids[0]
-    total = enc.numel() // seq_len
-    if total < n_samples:
-        print(f"  [calib] only {total} full sequences available, "
+    out: List[torch.Tensor] = []
+    for t in seqs:
+        t = t.reshape(-1)
+        if t.numel() < seq_len:
+            continue
+        out.append(t[:seq_len].clone())
+
+    if len(out) < n_samples:
+        print(f"  [calib] only {len(out)} full sequences available, "
               f"asked for {n_samples}")
-        n_samples = total
-    return [enc[i * seq_len:(i + 1) * seq_len].clone() for i in range(n_samples)]
+    return out[:n_samples]
 
 
 # --------------------------------------------------------------------------- #
@@ -127,8 +135,11 @@ def main():
                    help="output-channel groups; each gets its own Hessian")
     p.add_argument("--n-calib", type=int, default=128)
     p.add_argument("--seq-len", type=int, default=2048)
-    p.add_argument("--calib-dataset", type=str, default="wikitext2",
-                   choices=["wikitext2", "c4"])
+    p.add_argument("--calib-dataset", type=str, default=DEFAULT_CALIBRATION_DATASET,
+                   choices=list(CALIBRATION_DATASETS),
+                   help="Calibration corpus (default: c4)")
+    p.add_argument("--calib-cache-dir", type=str, default="./calibration_cache",
+                   help="Where calibration samples are cached")
     p.add_argument("--iters", type=int, default=3,
                    help="LNQ outer alternations (reference: 3)")
     p.add_argument("--cd-cycles", type=int, default=4,
@@ -176,7 +187,8 @@ def main():
     model.config.use_cache = False
 
     seqs = load_calibration(tokenizer, args.n_calib, args.seq_len,
-                            args.calib_dataset)
+                            args.calib_dataset, seed=args.seed,
+                            cache_dir=args.calib_cache_dir)
     print(f"  [calib] {len(seqs)} sequences x {args.seq_len} tokens")
 
     # ---------------- phase 1: saliency + weight gradients ------------------ #
