@@ -335,12 +335,24 @@ PY
 
 # --------------------------------------------------------------------------- #
 # The ladder. E first so the baseline is on record before anything else runs.
+#
+# CELLS selects which rungs run (space-separated). Default is the full ladder.
+# A hyper-param sweep wants CELLS="D_joint": cell E ignores every --flexnu-*
+# flag, so re-running it per config burns time for an identical number.
 # --------------------------------------------------------------------------- #
-cell "E_codebook${BITS}"  "codebook${BITS}"
-#cell "A_freeze_both"      "flexnu${BITS}"  --flexnu-freeze-codebook --flexnu-freeze-scale
-#cell "B_codebook_only"    "flexnu${BITS}"  --flexnu-freeze-scale
-#cell "C_divisor_only"     "flexnu${BITS}"  --flexnu-freeze-codebook
-cell "D_joint"            "flexnu${BITS}"
+CELLS=${CELLS:-"E D"}
+
+want_cell () {
+  for c in $CELLS; do [ "$c" = "$1" ] && return 0; done
+  return 1
+}
+
+# `if` rather than `&&`: under `set -e` a trailing false && ... would abort.
+if want_cell "E"; then cell "E_codebook${BITS}" "codebook${BITS}"; fi
+if want_cell "A"; then cell "A_freeze_both"   "flexnu${BITS}" --flexnu-freeze-codebook --flexnu-freeze-scale; fi
+if want_cell "B"; then cell "B_codebook_only" "flexnu${BITS}" --flexnu-freeze-scale; fi
+if want_cell "C"; then cell "C_divisor_only"  "flexnu${BITS}" --flexnu-freeze-codebook; fi
+if want_cell "D"; then cell "D_joint"         "flexnu${BITS}"; fi
 
 echo
 echo "############################################################"
