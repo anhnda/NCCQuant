@@ -120,15 +120,27 @@ STAGE_FRAC=${STAGE_FRAC:-0.0}
 # Memory knobs. row-block bounds the [row_block, in, K-1] threshold tensor;
 # gram-group-size bounds how many [in,in] Grams are held at once (each group
 # costs one extra calibration pass).
+# Row-slab size. Rows are independent given the shared Gram, so this does NOT
+# change the result -- it is purely occupancy/launch overhead. 128 leaves a
+# modern GPU idle on small models: each slab runs its own full ITERS-step Adam
+# loop, so out=8192 at RB=128 is 64 sequential loops for one Linear. Raise it
+# until memory bites; the [row_block, in, K-1] threshold tensor is the limit.
 ROW_BLOCK=${ROW_BLOCK:-128}
 GRAM_GROUP=${GRAM_GROUP:-8}
 GRAM_DEV=${GRAM_DEV:-cpu}
+
+# How often to evaluate the TRUE hard energy for best-iterate tracking. Each
+# evaluation is a second full energy pass plus a .item() device sync, so 1
+# roughly doubles step time and serializes the launch pipeline. The hard energy
+# is piecewise-constant, so a stride of 10-25 costs little resolution.
+EVAL_EVERY=${EVAL_EVERY:-1}
 
 FLEX_COMMON="--cb-block-size $CB_BLOCK --n-calib $N_CALIB --max-length $CALIB_LEN \
   --calib-dataset $CALIB_DATASET --calib-cache-dir $CALIB_CACHE \
   --no-ncc --flexnu-iters $ITERS --flexnu-lr-cb $LR_CB \
   --flexnu-lr-scale $LR_SCALE --flexnu-tau-frac $TAU_FRAC \
   --flexnu-stage-frac $STAGE_FRAC --flexnu-row-block $ROW_BLOCK \
+  --flexnu-eval-every $EVAL_EVERY \
   --gram-group-size $GRAM_GROUP --gram-store-device $GRAM_DEV \
   --flexnu-verbose"
 
@@ -205,6 +217,7 @@ fi
     echo "# eval: method=block seqlen=$SEQLEN dtype=$EVAL_DTYPE"
   fi
   echo "# flexnu: iters=$ITERS lr_cb=$LR_CB lr_scale=$LR_SCALE tau=$TAU_FRAC stage=$STAGE_FRAC"
+  echo "# perf: row_block=$ROW_BLOCK eval_every=$EVAL_EVERY gram_group=$GRAM_GROUP gram_dev=$GRAM_DEV"
   printf 'cell\tquantizer\twikitext2\tc4\tptb_new\tenergy_drop_pct\n'
 } > "$SUMMARY"
 
