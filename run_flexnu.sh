@@ -96,7 +96,7 @@ BITS=${BITS:-3}
 # input channels. Set CB_BLOCK=64 (or any positive int) for block-wise.
 CB_BLOCK=${CB_BLOCK:--1}
 N_CALIB=${N_CALIB:-128}
-CALIB_LEN=${CALIB_LEN:-512}     # calibration seqlen; unrelated to eval SEQLEN
+CALIB_LEN=${CALIB_LEN:-2048}     # calibration seqlen; unrelated to eval SEQLEN
 # Calibration corpus. c4 is the default (random-slice windows, standard
 # GPTQ/AWQ practice). Other options: redpajama, wikitext2.
 CALIB_DATASET=${CALIB_DATASET:-c4}

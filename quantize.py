@@ -370,7 +370,7 @@ def main():
     p.add_argument("--no-ncc", dest="use_ncc", action="store_false")
     p.add_argument("--budget-p", type=float, default=0.02, help="NCC budget fraction p")
     p.add_argument("--n-calib", type=int, default=128)
-    p.add_argument("--max-length", type=int, default=512)
+    p.add_argument("--max-length", type=int, default=2048)
     p.add_argument("--calib-dataset", type=str, default=DEFAULT_CALIBRATION_DATASET,
                    choices=list(CALIBRATION_DATASETS),
                    help="Calibration corpus (default: c4)")
